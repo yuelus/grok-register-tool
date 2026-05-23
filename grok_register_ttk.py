@@ -46,6 +46,19 @@ DEFAULT_CONFIG = {
     "grok2api_remote_app_key": "",
     "register_threads": 1,
     "thread_start_interval": 0.8,
+
+    # ---- CPA (CLIProxyAPI) auth-file import ----
+    # When enabled, after a successful registration we drive the xAI OAuth
+    # login with the just-registered email/password, exchange the code for
+    # tokens, and POST a multipart xai-{email}.json to CPA's
+    # /v0/management/auth-files. Optionally a local copy of the JSON record
+    # is kept under cpa_records_dir.
+    "cpa_auto_import": False,
+    "cpa_base_url": "http://192.168.1.160:8317",
+    "cpa_management_key": "",
+    "cpa_save_json": False,
+    "cpa_records_dir": "cpa_records",
+    "cpa_timeout_s": 240,
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -191,21 +204,66 @@ def _pick_list_payload(data):
     return []
 
 
-def cloudflare_create_temp_address(api_base):
-    """适配 cloudflare_temp_email v1.8.x: POST /api/new_address -> {address,jwt}"""
+def _cloudflare_pick_default_domain():
+    """从 defaultDomains 配置里轮询取一个域名，没配置就返回 None。"""
     global _cf_domain_index
+    try:
+        domains = [x.strip() for x in str(config.get("defaultDomains", "") or "").split(",") if x.strip()]
+    except Exception:
+        domains = []
+    if not domains:
+        return None
+    domain = domains[_cf_domain_index % len(domains)]
+    _cf_domain_index += 1
+    return domain
+
+
+def _cloudflare_admin_create_address(api_base, admin_key, domain):
+    """走管理员路由创建邮箱：POST /admin/new_address，header 用 x-admin-auth。"""
+    payload = {"name": generate_username(10), "enablePrefix": False}
+    if domain:
+        payload["domain"] = domain
+    headers = {"Content-Type": "application/json", "x-admin-auth": admin_key}
+    resp = http_post(f"{api_base}/admin/new_address", json=payload, headers=headers)
+    resp.raise_for_status()
+    try:
+        data = resp.json()
+    except Exception:
+        raise Exception(f"Cloudflare /admin/new_address 返回非JSON: {resp.text[:300]}")
+    address = data.get("address")
+    jwt = data.get("jwt")
+    if not address or not jwt:
+        raise Exception(f"Cloudflare /admin/new_address 缺少 address/jwt: {data}")
+    return address, jwt
+
+
+def cloudflare_create_temp_address(api_base):
+    """适配 cloudflare_temp_email：优先走 /admin/new_address，回退到匿名 /api/new_address。"""
+    domain = _cloudflare_pick_default_domain()
+    admin_key = get_cloudflare_api_key()
+
+    # 当后端开启 disableAnonymousUserCreateEmail 时，匿名 /api/new_address 会被拒。
+    # 只要配置了 admin key 就先走管理员路由，命中即直接返回。
+    admin_err = None
+    if admin_key:
+        try:
+            return _cloudflare_admin_create_address(api_base, admin_key, domain)
+        except Exception as exc:
+            admin_err = exc
+
     url = f"{api_base}/api/new_address"
     payload = {}
+    if domain:
+        payload["domain"] = domain
+    headers = cloudflare_build_headers(content_type=True)
+    params = cloudflare_apply_auth_params()
+    resp = http_post(url, json=payload, headers=headers, params=params)
     try:
-        # 在多个域名之间轮换，降低单域偶发不收件导致的失败率
-        domains = [x.strip() for x in str(config.get("defaultDomains", "") or "").split(",") if x.strip()]
-        if domains:
-            payload["domain"] = domains[_cf_domain_index % len(domains)]
-            _cf_domain_index += 1
-    except Exception:
-        pass
-    resp = http_post(url, json=payload, headers={"Content-Type": "application/json"})
-    resp.raise_for_status()
+        resp.raise_for_status()
+    except Exception as anon_exc:
+        if admin_err is not None:
+            raise Exception(f"Cloudflare 创建邮箱失败 admin={admin_err} anon={anon_exc}")
+        raise
     try:
         data = resp.json()
     except Exception:
@@ -279,6 +337,25 @@ def add_token_to_grok2api_local_pool(raw_token, email="", log_callback=None):
     return True
 
 
+def _grok2api_admin_url(base, path):
+    """grok2api 管理后台路径全部走 /admin/api/...，老配置写成 / 直接根路径的也能兼容。"""
+    base = base.rstrip("/")
+    path = "/" + path.lstrip("/")
+    if "/admin/api" in base:
+        return f"{base}{path}"
+    return f"{base}/admin/api{path}"
+
+
+def _grok2api_admin_auth(app_key):
+    """同时带 Bearer header 和 app_key query，兼容不同 grok2api 版本。"""
+    headers = {"Content-Type": "application/json"}
+    query = {}
+    if app_key:
+        headers["Authorization"] = f"Bearer {app_key}"
+        query["app_key"] = app_key
+    return headers, query
+
+
 def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
     token = _normalize_sso_token(raw_token)
     if not token:
@@ -290,15 +367,15 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
         if log_callback:
             log_callback("[Debug] grok2api 远端未配置 base/app_key，跳过")
         return False
-    headers = {"Content-Type": "application/json"}
-    query = {"app_key": app_key}
+    headers, query = _grok2api_admin_auth(app_key)
     pool_map = {"ssoBasic": "basic", "ssoSuper": "super"}
     remote_pool = pool_map.get(pool_name, "basic")
-    # 优先使用 add 接口，避免全量覆盖远端池
+
+    add_url = _grok2api_admin_url(base, "/tokens/add")
+    add_payload = {"tokens": [token], "pool": remote_pool, "tags": ["auto-register"]}
     try:
-        add_payload = {"tokens": [token], "pool": remote_pool, "tags": ["auto-register"]}
         resp_add = http_post(
-            f"{base}/tokens/add",
+            add_url,
             headers=headers,
             params=query,
             json=add_payload,
@@ -307,16 +384,24 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
         )
         resp_add.raise_for_status()
         if log_callback:
-            log_callback(f"[+] 已写入 grok2api 远端池: {pool_name} ({base}/tokens/add)")
+            log_callback(f"[+] 已写入 grok2api 远端池: {pool_name} ({add_url})")
         return True
     except Exception as add_exc:
+        msg = str(add_exc)
+        if "401" in msg or "Invalid authentication" in msg:
+            if log_callback:
+                log_callback(
+                    f"[Debug] grok2api 远端鉴权失败(401)，请检查 grok2api_remote_app_key 是否与后台密码一致: {add_exc}"
+                )
+            return False
         if log_callback:
-            log_callback(f"[Debug] /tokens/add 写入失败，尝试 /tokens 全量模式: {add_exc}")
+            log_callback(f"[Debug] /admin/api/tokens/add 写入失败，尝试全量保存: {add_exc}")
 
-    # 兜底：旧版全量保存接口
+    # 兜底：旧版全量保存接口（同样走 /admin/api/tokens）
+    list_url = _grok2api_admin_url(base, "/tokens")
     current = {}
     try:
-        resp = http_get(f"{base}/tokens", headers=headers, params=query, timeout=20, proxies={})
+        resp = http_get(list_url, headers=headers, params=query, timeout=20, proxies={})
         if resp.status_code == 200:
             payload = resp.json()
             current = payload.get("tokens", {}) if isinstance(payload, dict) else {}
@@ -336,10 +421,10 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
     if token not in existing:
         pool.append({"token": token, "tags": ["auto-register"], "note": email})
     current[pool_name] = pool
-    resp2 = http_post(f"{base}/tokens", headers=headers, params=query, json=current, timeout=30, proxies={})
+    resp2 = http_post(list_url, headers=headers, params=query, json=current, timeout=30, proxies={})
     resp2.raise_for_status()
     if log_callback:
-        log_callback(f"[+] 已写入 grok2api 远端池: {pool_name} ({base}/tokens)")
+        log_callback(f"[+] 已写入 grok2api 远端池: {pool_name} ({list_url})")
     return True
 
 
@@ -356,6 +441,76 @@ def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] 写入 grok2api 远端池失败: {exc}")
+
+
+def import_account_to_cpa(email, password, log_callback=None):
+    """After a successful registration, drive xAI OAuth with the brand-new
+    credentials and upload xai-{email}.json to CPA. Lazy-imports
+    cpa_xai_oauth so users that don't enable this feature pay no startup
+    cost. Failures are logged and swallowed — they must NOT block the
+    main register flow (which has already produced a usable sso token)."""
+    if not config.get("cpa_auto_import", False):
+        return False
+    base = str(config.get("cpa_base_url", "") or "").strip().rstrip("/")
+    mgmt = str(config.get("cpa_management_key", "") or "").strip()
+    if not base or not mgmt:
+        if log_callback:
+            log_callback("[!] CPA 自动导入已开启但 Base URL / Management Key 未配置，跳过")
+        return False
+    try:
+        timeout_s = int(config.get("cpa_timeout_s", 240) or 240)
+    except Exception:
+        timeout_s = 240
+    out_path = None
+    if config.get("cpa_save_json", False):
+        out_dir = str(config.get("cpa_records_dir", "cpa_records") or "cpa_records").strip()
+        if not os.path.isabs(out_dir):
+            out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), out_dir)
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            safe = email.replace("/", "_").replace("\\", "_")
+            out_path = os.path.join(out_dir, f"xai-{safe}.json")
+        except Exception as e:
+            if log_callback:
+                log_callback(f"[Debug] 无法创建 CPA 记录目录 {out_dir}: {e}")
+            out_path = None
+
+    try:
+        # Lazy import: cpa_xai_oauth opens its own DrissionPage browser and
+        # we don't want to pay that cost (or the import-time logging) when
+        # the feature is disabled.
+        import cpa_xai_oauth
+    except Exception as e:
+        if log_callback:
+            log_callback(f"[!] 无法加载 cpa_xai_oauth 模块: {e}")
+        return False
+
+    if log_callback:
+        log_callback(f"[*] CPA 导入开始: {email} -> {base}")
+    try:
+        result = cpa_xai_oauth.process_account_self(
+            email=email,
+            password=password,
+            cap_base_url=base,
+            management_key=mgmt,
+            timeout_s=timeout_s,
+            out_path=out_path,
+            log_callback=log_callback,
+        )
+    except Exception as e:
+        if log_callback:
+            log_callback(f"[-] CPA 导入异常: {e}")
+        return False
+
+    if result.get("ok"):
+        up = result.get("upload") or {}
+        if log_callback:
+            log_callback(f"[+] CPA 导入成功: {email} (status={up.get('status', '?')})")
+        return True
+    err = result.get("error") or "unknown"
+    if log_callback:
+        log_callback(f"[-] CPA 导入失败 {email}: {err}")
+    return False
 
 
 def create_browser_options():
@@ -512,16 +667,29 @@ def cloudflare_get_token(api_base, address, password, api_key=None):
 
 def cloudflare_get_messages(api_base, token):
     headers = {"Authorization": f"Bearer {token}"}
-    path = get_cloudflare_path("cloudflare_path_messages", "/messages")
-    params = {"limit": 20, "offset": 0}
-    params = cloudflare_apply_auth_params(params)
-    resp = http_get(f"{api_base}{path}", headers=headers, params=params)
-    resp.raise_for_status()
-    try:
-        data = resp.json()
-    except Exception:
-        raise Exception(f"Cloudflare messages 返回非JSON: {resp.text[:300]}")
-    return _pick_list_payload(data)
+    configured = get_cloudflare_path("cloudflare_path_messages", "/messages")
+    candidates = []
+    seen = set()
+    # cloudflare_temp_email 新版的实际路径是 /api/mails；老配置用 /messages 也保留兜底
+    for path in ("/api/mails", configured):
+        if path and path not in seen:
+            candidates.append(path)
+            seen.add(path)
+    params = cloudflare_apply_auth_params({"limit": 20, "offset": 0})
+    last_err = None
+    for path in candidates:
+        try:
+            resp = http_get(f"{api_base}{path}", headers=headers, params=params)
+            resp.raise_for_status()
+            try:
+                data = resp.json()
+            except Exception:
+                raise Exception(f"Cloudflare messages 返回非JSON: {resp.text[:300]}")
+            return _pick_list_payload(data)
+        except Exception as exc:
+            last_err = exc
+            continue
+    raise Exception(f"Cloudflare 拉取邮件列表失败: {last_err}")
 
 
 def cloudflare_get_message_detail(api_base, token, message_id):
@@ -1759,6 +1927,8 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
     last_seen_names = set()
     last_submit_retry = 0.0
     last_cf_retry_at = 0.0
+    grok_visited = False
+    last_grok_visit_at = 0.0
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -1843,21 +2013,46 @@ return String(cfInput.value || '').trim().length;
                         last_cf_retry_at = now
 
             cookies = page.cookies(all_domains=True, all_info=True) or []
+            grok_sso = None
             for item in cookies:
                 if isinstance(item, dict):
                     name = str(item.get("name", "")).strip()
                     value = str(item.get("value", "")).strip()
+                    domain = str(item.get("domain", "")).strip().lower()
                 else:
                     name = str(getattr(item, "name", "")).strip()
                     value = str(getattr(item, "value", "")).strip()
+                    domain = str(getattr(item, "domain", "")).strip().lower()
 
                 if name:
                     last_seen_names.add(name)
 
-                if name == "sso" and value:
+                # 只取 grok.com 域下的 sso（grok2api 使用的就是这个），
+                # 忽略 accounts.x.ai 等窄作用域 cookie，避免拿到的是登录链路里的临时凭据
+                if name == "sso" and value and "grok.com" in domain:
+                    grok_sso = value
                     if log_callback:
-                        log_callback("[*] 已获取到 sso cookie")
-                    return value
+                        log_callback(f"[*] 已获取到 grok.com 的 sso cookie (domain={domain})")
+                    return grok_sso
+
+            # 走到这里说明还没拿到 grok.com 域的 sso：注册成功后页面会停在 accounts.x.ai
+            # 需要主动跳一次 grok.com，让服务端把 grok 域下的 sso 种到浏览器
+            try:
+                current_url = (page.url or "").lower()
+            except Exception:
+                current_url = ""
+            on_signup_page = "accounts.x.ai" in current_url
+            need_revisit = (not grok_visited) or (now - last_grok_visit_at >= 8 and "grok.com" not in current_url)
+            if not on_signup_page and need_revisit:
+                try:
+                    page.get("https://grok.com/")
+                    grok_visited = True
+                    last_grok_visit_at = now
+                    if log_callback and not grok_visited:
+                        log_callback("[*] 跳转 grok.com 以拉取 sso cookie")
+                except Exception as nav_exc:
+                    if log_callback:
+                        log_callback(f"[Debug] 跳转 grok.com 失败: {nav_exc}")
         except PageDisconnectedError:
             refresh_active_page()
         except Exception:
@@ -1883,7 +2078,6 @@ class GrokRegisterGUI:
         self.results = []
         self.stop_requested = False
         self.ui_queue = queue.Queue()
-        self.accounts_output_file = ""
         self.stats_lock = threading.Lock()
         self._tutorial_window = None
         self.setup_ui()
@@ -1985,6 +2179,35 @@ class GrokRegisterGUI:
         self.default_domains_var = tk.StringVar(value=str(config.get("defaultDomains", "")))
         self.default_domains_entry = ttk.Entry(config_frame, textvariable=self.default_domains_var, width=30)
         self.default_domains_entry.grid(row=14, column=1, columnspan=3, sticky=tk.W, padx=5)
+
+        ttk.Label(config_frame, text="CPA 注册后自动导入:").grid(row=15, column=0, sticky=tk.W)
+        self.cpa_auto_import_var = tk.BooleanVar(value=bool(config.get("cpa_auto_import", False)))
+        self.cpa_auto_import_check = ttk.Checkbutton(config_frame, variable=self.cpa_auto_import_var)
+        self.cpa_auto_import_check.grid(row=15, column=1, sticky=tk.W, padx=5)
+        ttk.Label(config_frame, text="单账号超时(秒):").grid(row=15, column=2, sticky=tk.W, padx=10)
+        self.cpa_timeout_var = tk.StringVar(value=str(config.get("cpa_timeout_s", 240)))
+        self.cpa_timeout_spinbox = ttk.Spinbox(config_frame, from_=30, to=1800, increment=30, width=8, textvariable=self.cpa_timeout_var)
+        self.cpa_timeout_spinbox.grid(row=15, column=3, sticky=tk.W, padx=5)
+
+        ttk.Label(config_frame, text="CPA Base URL:").grid(row=16, column=0, sticky=tk.W)
+        self.cpa_base_url_var = tk.StringVar(value=str(config.get("cpa_base_url", "")))
+        self.cpa_base_url_entry = ttk.Entry(config_frame, textvariable=self.cpa_base_url_var, width=30)
+        self.cpa_base_url_entry.grid(row=16, column=1, columnspan=3, sticky=tk.W, padx=5)
+
+        ttk.Label(config_frame, text="CPA Management Key:").grid(row=17, column=0, sticky=tk.W)
+        self.cpa_management_key_var = tk.StringVar(value=str(config.get("cpa_management_key", "")))
+        self.cpa_management_key_entry = ttk.Entry(config_frame, textvariable=self.cpa_management_key_var, width=30, show="*")
+        self.cpa_management_key_entry.grid(row=17, column=1, columnspan=3, sticky=tk.W, padx=5)
+
+        ttk.Label(config_frame, text="保存 JSON 文件:").grid(row=18, column=0, sticky=tk.W)
+        self.cpa_save_json_var = tk.BooleanVar(value=bool(config.get("cpa_save_json", False)))
+        self.cpa_save_json_check = ttk.Checkbutton(config_frame, variable=self.cpa_save_json_var)
+        self.cpa_save_json_check.grid(row=18, column=1, sticky=tk.W, padx=5)
+        ttk.Label(config_frame, text="输出目录:").grid(row=18, column=2, sticky=tk.W, padx=10)
+        self.cpa_records_dir_var = tk.StringVar(value=str(config.get("cpa_records_dir", "cpa_records")))
+        self.cpa_records_dir_entry = ttk.Entry(config_frame, textvariable=self.cpa_records_dir_var, width=18)
+        self.cpa_records_dir_entry.grid(row=18, column=3, sticky=tk.W, padx=5)
+
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X, pady=10)
         self.start_btn = ttk.Button(btn_frame, text="开始注册", command=self.start_registration)
@@ -2155,6 +2378,12 @@ class GrokRegisterGUI:
     def should_stop(self):
         return self.stop_requested or not self.is_running
 
+    def _get_accounts_file_path(self):
+        date_str = datetime.datetime.now().strftime("%Y%m%d")
+        return os.path.join(
+            os.path.dirname(__file__), f"accounts_{date_str}.txt"
+        )
+
     def start_registration(self):
         if self.is_running:
             self.log("[!] 当前已有任务在运行")
@@ -2173,6 +2402,15 @@ class GrokRegisterGUI:
         config["grok2api_remote_base"] = self.grok2api_remote_base_var.get().strip()
         config["grok2api_remote_app_key"] = self.grok2api_remote_key_var.get().strip()
         config["defaultDomains"] = self.default_domains_var.get().strip()
+        config["cpa_auto_import"] = bool(self.cpa_auto_import_var.get())
+        config["cpa_base_url"] = self.cpa_base_url_var.get().strip()
+        config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
+        config["cpa_save_json"] = bool(self.cpa_save_json_var.get())
+        config["cpa_records_dir"] = self.cpa_records_dir_var.get().strip() or "cpa_records"
+        try:
+            config["cpa_timeout_s"] = max(30, min(1800, int(self.cpa_timeout_var.get())))
+        except Exception:
+            config["cpa_timeout_s"] = 240
         try:
             config["register_threads"] = max(1, min(10, int(self.thread_var.get())))
         except Exception:
@@ -2197,14 +2435,11 @@ class GrokRegisterGUI:
         self.fail_count = 0
         self.results = []
         now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.accounts_output_file = os.path.join(
-            os.path.dirname(__file__), f"accounts_{now}.txt"
-        )
         self.update_stats()
         self._set_running_ui(True)
         worker_count = max(1, min(config.get("register_threads", 1), count))
         self.log(f"[*] 配置已保存，开始执行。目标数量: {count}，并发线程: {worker_count}")
-        self.log(f"[*] 成功账号将实时保存到: {self.accounts_output_file}")
+        self.log(f"[*] 成功账号将按天追加保存到: {self._get_accounts_file_path()}（本次任务标记 {now}）")
         threading.Thread(
             target=self.run_registration,
             args=(count, worker_count),
@@ -2258,12 +2493,25 @@ class GrokRegisterGUI:
             self.success_count += 1
             line = f"{email}----{profile.get('password','')}----{sso}\n"
             try:
-                with open(self.accounts_output_file, "a", encoding="utf-8") as f:
+                with open(self._get_accounts_file_path(), "a", encoding="utf-8") as f:
                     f.write(line)
             except Exception as file_exc:
                 logf(f"[Debug] 保存账号文件失败: {file_exc}")
         add_token_to_grok2api_pools(sso, email=email, log_callback=logf)
         logf(f"[+] 注册成功: {email}")
+        # CPA auto-import (optional). Drives a brand-new headed Chromium
+        # for the xAI OAuth login → token → upload, using the password we
+        # just registered. Failures are logged but do not roll back the
+        # already-saved account record.
+        if config.get("cpa_auto_import", False):
+            try:
+                import_account_to_cpa(
+                    email,
+                    profile.get("password", ""),
+                    log_callback=logf,
+                )
+            except Exception as cpa_exc:
+                logf(f"[-] CPA 导入异常(忽略): {cpa_exc}")
 
     def _worker_loop(self, worker_id, total, task_queue):
         prefix = f"[T{worker_id}]"
