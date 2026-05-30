@@ -2629,10 +2629,10 @@ class GrokRegisterGUI:
         ttk.Button(btn_frame, text="关闭", command=win.destroy).pack(side=tk.LEFT, padx=5)
 
     def outlook_manage_accounts_dialog(self):
-        """Outlook 账号管理弹窗：查看状态、重置、删除。"""
+        """Outlook 账号管理弹窗：增删查改 + 批量操作。"""
         win = tk.Toplevel(self.root)
         win.title("管理 Outlook 账号")
-        win.geometry("750x420")
+        win.geometry("820x500")
         win.transient(self.root)
         win.grab_set()
 
@@ -2641,36 +2641,56 @@ class GrokRegisterGUI:
         is_alias = provider == "outlook-alias"
         max_alias = config.get("outlook_alias_max_per_account", 5)
 
-        # 顶部信息
+        # --- 顶部：信息 + 搜索 ---
+        top_frame = ttk.Frame(win)
+        top_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
+
         info_text = f"共 {len(accounts)} 个账号"
         if is_alias:
-            info_text += f"  |  模式: 别名  |  每账号上限: {max_alias}"
+            info_text += f"  |  别名模式  |  每账号上限: {max_alias}"
         else:
-            info_text += "  |  模式: 直连"
-        ttk.Label(win, text=info_text).pack(anchor=tk.W, padx=10, pady=(10, 5))
+            info_text += "  |  直连模式"
+        self.outlook_manage_info_label = ttk.Label(top_frame, text=info_text)
+        self.outlook_manage_info_label.pack(side=tk.LEFT)
 
-        # Treeview 表格
-        columns = ("email", "status", "used", "aliases", "info")
-        tree = ttk.Treeview(win, columns=columns, show="headings", height=12)
+        ttk.Label(top_frame, text="  搜索:").pack(side=tk.LEFT, padx=(15, 2))
+        search_var = tk.StringVar()
+        search_entry = ttk.Entry(top_frame, textvariable=search_var, width=25)
+        search_entry.pack(side=tk.LEFT)
+
+        # --- Treeview 表格 ---
+        columns = ("email", "password", "clientId", "refreshToken", "status", "used", "aliases")
+        tree = ttk.Treeview(win, columns=columns, show="headings", height=15, selectmode="extended")
         tree.heading("email", text="邮箱")
+        tree.heading("password", text="密码")
+        tree.heading("clientId", text="ClientId")
+        tree.heading("refreshToken", text="RefreshToken")
         tree.heading("status", text="状态")
         tree.heading("used", text="已用" if not is_alias else "用尽")
         tree.heading("aliases", text="别名数")
-        tree.heading("info", text="备注")
-        tree.column("email", width=220)
-        tree.column("status", width=60, anchor=tk.CENTER)
-        tree.column("used", width=50, anchor=tk.CENTER)
-        tree.column("aliases", width=60, anchor=tk.CENTER)
-        tree.column("info", width=180)
+        tree.column("email", width=180)
+        tree.column("password", width=60)
+        tree.column("clientId", width=100)
+        tree.column("refreshToken", width=120)
+        tree.column("status", width=55, anchor=tk.CENTER)
+        tree.column("used", width=40, anchor=tk.CENTER)
+        tree.column("aliases", width=50, anchor=tk.CENTER)
+
         scrollbar = ttk.Scrollbar(win, orient=tk.VERTICAL, command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0), pady=5)
         scrollbar.pack(side=tk.LEFT, fill=tk.Y, pady=5, padx=(0, 10))
 
+        def _filter_accounts():
+            """根据搜索框过滤账号列表。"""
+            keyword = search_var.get().strip().lower()
+            return [a for a in config.get("outlook_accounts", [])
+                    if not keyword or keyword in (a.get("email", "").lower())]
+
         def refresh_tree():
             for item in tree.get_children():
                 tree.delete(item)
-            for a in config.get("outlook_accounts", []):
+            for a in _filter_accounts():
                 used = a.get("used", False)
                 alias_count = a.get("alias_used_count", 0)
                 has_rt = bool(a.get("refreshToken"))
@@ -2682,18 +2702,131 @@ class GrokRegisterGUI:
                     status = "可用" if has_rt and not used else ("已用" if used else "无Token")
                     used_text = "是" if used else "否"
                     alias_text = "-"
-                info = ""
-                if not has_rt:
-                    info = "缺少 refreshToken"
                 tree.insert("", tk.END, iid=a.get("email", ""), values=(
-                    a.get("email", ""), status, used_text, alias_text, info
+                    a.get("email", ""),
+                    a.get("password", ""),
+                    a.get("clientId", ""),
+                    a.get("refreshToken", ""),
+                    status, used_text, alias_text,
                 ))
+            total = len(config.get("outlook_accounts", []))
+            filtered = len(tree.get_children())
+            info = f"共 {total} 个账号"
+            if filtered < total:
+                info += f"  (显示 {filtered} 个)"
+            if is_alias:
+                info += f"  |  别名模式  |  每账号上限: {max_alias}"
+            else:
+                info += "  |  直连模式"
+            self.outlook_manage_info_label.config(text=info)
 
+        def on_search(*_):
+            refresh_tree()
+        search_var.trace_add("write", on_search)
         refresh_tree()
 
-        # 底部按钮
+        # --- 右键菜单 ---
+        context_menu = tk.Menu(win, tearoff=0)
+        context_menu.add_command(label="编辑选中", command=lambda: edit_selected())
+        context_menu.add_separator()
+        context_menu.add_command(label="复制邮箱", command=lambda: self._copy_tree_column(tree, "email"))
+        context_menu.add_command(label="复制 ClientId", command=lambda: self._copy_tree_column(tree, "clientId"))
+        context_menu.add_command(label="复制 RefreshToken", command=lambda: self._copy_tree_column(tree, "refreshToken"))
+
+        def show_context_menu(event):
+            iid = tree.identify_row(event.y)
+            if iid and iid not in tree.selection():
+                tree.selection_set(iid)
+            context_menu.tk_popup(event.x_root, event.y_root)
+
+        tree.bind("<Button-3>", show_context_menu)
+
+        # --- 底部按钮 ---
         btn_frame = ttk.Frame(win)
         btn_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        def add_single():
+            """添加单个账号。"""
+            dlg = tk.Toplevel(win)
+            dlg.title("添加 Outlook 账号")
+            dlg.geometry("450x220")
+            dlg.transient(win)
+            dlg.grab_set()
+
+            fields = [("邮箱:", "email"), ("密码:", "password"), ("ClientId:", "clientId"), ("RefreshToken:", "refreshToken")]
+            entries = {}
+            for i, (label, key) in enumerate(fields):
+                ttk.Label(dlg, text=label).grid(row=i, column=0, sticky=tk.W, padx=10, pady=3)
+                var = tk.StringVar()
+                ttk.Entry(dlg, textvariable=var, width=45).grid(row=i, column=1, padx=10, pady=3)
+                entries[key] = var
+
+            def do_add():
+                email = entries["email"].get().strip()
+                if not email:
+                    return
+                existing = {a["email"].lower() for a in config.get("outlook_accounts", [])}
+                if email.lower() in existing:
+                    ttk.Label(dlg, text="该邮箱已存在", foreground="red").grid(row=len(fields), column=0, columnspan=2)
+                    return
+                config.setdefault("outlook_accounts", []).append({
+                    "email": email,
+                    "password": entries["password"].get().strip(),
+                    "clientId": entries["clientId"].get().strip(),
+                    "refreshToken": entries["refreshToken"].get().strip(),
+                    "used": False,
+                    "alias_used_count": 0,
+                })
+                save_config()
+                refresh_tree()
+                self.outlook_count_label.config(text=f"已导入 {len(config['outlook_accounts'])} 个")
+                dlg.destroy()
+
+            ttk.Button(dlg, text="添加", command=do_add).grid(row=len(fields), column=0, columnspan=2, pady=10)
+
+        def edit_selected():
+            """编辑选中的账号。"""
+            selected = tree.selection()
+            if not selected:
+                return
+            email = selected[0]
+            account = next((a for a in config.get("outlook_accounts", []) if a.get("email") == email), None)
+            if not account:
+                return
+
+            dlg = tk.Toplevel(win)
+            dlg.title(f"编辑: {email}")
+            dlg.geometry("450x220")
+            dlg.transient(win)
+            dlg.grab_set()
+
+            fields = [("邮箱:", "email"), ("密码:", "password"), ("ClientId:", "clientId"), ("RefreshToken:", "refreshToken")]
+            entries = {}
+            for i, (label, key) in enumerate(fields):
+                ttk.Label(dlg, text=label).grid(row=i, column=0, sticky=tk.W, padx=10, pady=3)
+                var = tk.StringVar(value=account.get(key, ""))
+                ttk.Entry(dlg, textvariable=var, width=45).grid(row=i, column=1, padx=10, pady=3)
+                entries[key] = var
+
+            def do_save():
+                new_email = entries["email"].get().strip()
+                if not new_email:
+                    return
+                # 如果邮箱改了，检查重复
+                if new_email.lower() != email.lower():
+                    existing = {a["email"].lower() for a in config.get("outlook_accounts", []) if a.get("email") != email}
+                    if new_email.lower() in existing:
+                        ttk.Label(dlg, text="该邮箱已存在", foreground="red").grid(row=len(fields), column=0, columnspan=2)
+                        return
+                account["email"] = new_email
+                account["password"] = entries["password"].get().strip()
+                account["clientId"] = entries["clientId"].get().strip()
+                account["refreshToken"] = entries["refreshToken"].get().strip()
+                save_config()
+                refresh_tree()
+                dlg.destroy()
+
+            ttk.Button(dlg, text="保存", command=do_save).grid(row=len(fields), column=0, columnspan=2, pady=10)
 
         def reset_selected():
             for iid in tree.selection():
@@ -2717,15 +2850,84 @@ class GrokRegisterGUI:
             selected = set(tree.selection())
             if not selected:
                 return
+            count = len(selected)
+            if not messagebox.askyesno("确认删除", f"确定删除选中的 {count} 个账号？"):
+                return
             config["outlook_accounts"] = [a for a in config.get("outlook_accounts", []) if a.get("email") not in selected]
             save_config()
             refresh_tree()
             self.outlook_count_label.config(text=f"已导入 {len(config['outlook_accounts'])} 个")
 
-        ttk.Button(btn_frame, text="重置选中", command=reset_selected).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="全部重置", command=reset_all).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="删除选中", command=delete_selected).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="关闭", command=win.destroy).pack(side=tk.RIGHT, padx=5)
+        def select_all():
+            tree.selection_set(tree.get_children())
+
+        def deselect_all():
+            tree.selection_remove(*tree.selection())
+
+        def export_accounts():
+            """导出账号到文本框。"""
+            dlg = tk.Toplevel(win)
+            dlg.title("导出 Outlook 账号")
+            dlg.geometry("600x400")
+            dlg.transient(win)
+
+            text_widget = scrolledtext.ScrolledText(dlg, width=70, height=18)
+            text_widget.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            lines = []
+            for a in config.get("outlook_accounts", []):
+                lines.append(f"{a.get('email','')}----{a.get('password','')}----{a.get('clientId','')}----{a.get('refreshToken','')}")
+            text_widget.insert("1.0", "\n".join(lines))
+            text_widget.config(state=tk.DISABLED)
+
+            def copy_all():
+                dlg.clipboard_clear()
+                dlg.clipboard_append(text_widget.get("1.0", tk.END))
+                copy_btn.config(text="已复制")
+
+            copy_btn = ttk.Button(dlg, text="复制全部", command=copy_all)
+            copy_btn.pack(pady=(0, 10))
+
+        # 第一行按钮
+        ttk.Button(btn_frame, text="添加", command=add_single).pack(side=tk.LEFT, padx=3)
+
+        def open_import():
+            """临时释放 grab 打开导入弹窗，关闭后恢复并刷新。"""
+            win.grab_release()
+            self.outlook_import_accounts_dialog()
+            try:
+                win.grab_set()
+            except Exception:
+                pass
+            refresh_tree()
+
+        ttk.Button(btn_frame, text="导入", command=open_import).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_frame, text="编辑", command=edit_selected).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_frame, text="导出", command=export_accounts).pack(side=tk.LEFT, padx=3)
+        sep = ttk.Separator(btn_frame, orient=tk.VERTICAL)
+        sep.pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=2)
+        ttk.Button(btn_frame, text="重置选中", command=reset_selected).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_frame, text="全部重置", command=reset_all).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_frame, text="删除选中", command=delete_selected).pack(side=tk.LEFT, padx=3)
+        sep2 = ttk.Separator(btn_frame, orient=tk.VERTICAL)
+        sep2.pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=2)
+        ttk.Button(btn_frame, text="全选", command=select_all).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_frame, text="取消选择", command=deselect_all).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_frame, text="关闭", command=win.destroy).pack(side=tk.RIGHT, padx=3)
+
+    def _copy_tree_column(self, tree, column):
+        """复制 Treeview 选中行的指定列到剪贴板。"""
+        selected = tree.selection()
+        if not selected:
+            return
+        values = []
+        for iid in selected:
+            item = tree.item(iid)
+            col_idx = tree["columns"].index(column) if column in tree["columns"] else -1
+            if col_idx >= 0 and item.get("values"):
+                values.append(str(item["values"][col_idx]))
+        if values:
+            self.root.clipboard_clear()
+            self.root.clipboard_append("\n".join(values))
 
     def start_registration(self):
         if self.is_running:
