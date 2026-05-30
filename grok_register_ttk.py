@@ -2632,7 +2632,7 @@ class GrokRegisterGUI:
         """Outlook 账号管理弹窗：增删查改 + 批量操作。"""
         win = tk.Toplevel(self.root)
         win.title("管理 Outlook 账号")
-        win.geometry("820x500")
+        win.geometry("860x520")
         win.transient(self.root)
         win.grab_set()
 
@@ -2741,9 +2741,11 @@ class GrokRegisterGUI:
 
         tree.bind("<Button-3>", show_context_menu)
 
-        # --- 底部按钮 ---
-        btn_frame = ttk.Frame(win)
-        btn_frame.pack(fill=tk.X, padx=10, pady=5)
+        # --- 底部按钮（两行） ---
+        btn_frame1 = ttk.Frame(win)
+        btn_frame1.pack(fill=tk.X, padx=10, pady=(10, 2))
+        btn_frame2 = ttk.Frame(win)
+        btn_frame2.pack(fill=tk.X, padx=10, pady=(0, 5))
 
         def add_single():
             """添加单个账号。"""
@@ -2887,8 +2889,8 @@ class GrokRegisterGUI:
             copy_btn = ttk.Button(dlg, text="复制全部", command=copy_all)
             copy_btn.pack(pady=(0, 10))
 
-        # 第一行按钮
-        ttk.Button(btn_frame, text="添加", command=add_single).pack(side=tk.LEFT, padx=3)
+        # 第一行：添加、导入、编辑、导出、关闭
+        ttk.Button(btn_frame1, text="添加", command=add_single).pack(side=tk.LEFT, padx=3)
 
         def open_import():
             """临时释放 grab 打开导入弹窗，关闭后恢复并刷新。"""
@@ -2900,19 +2902,19 @@ class GrokRegisterGUI:
                 pass
             refresh_tree()
 
-        ttk.Button(btn_frame, text="导入", command=open_import).pack(side=tk.LEFT, padx=3)
-        ttk.Button(btn_frame, text="编辑", command=edit_selected).pack(side=tk.LEFT, padx=3)
-        ttk.Button(btn_frame, text="导出", command=export_accounts).pack(side=tk.LEFT, padx=3)
-        sep = ttk.Separator(btn_frame, orient=tk.VERTICAL)
+        ttk.Button(btn_frame1, text="导入", command=open_import).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_frame1, text="编辑", command=edit_selected).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_frame1, text="导出", command=export_accounts).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_frame1, text="关闭", command=win.destroy).pack(side=tk.RIGHT, padx=3)
+
+        # 第二行：全选、取消选择、重置选中、全部重置、删除选中
+        ttk.Button(btn_frame2, text="全选", command=select_all).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_frame2, text="取消选择", command=deselect_all).pack(side=tk.LEFT, padx=3)
+        sep = ttk.Separator(btn_frame2, orient=tk.VERTICAL)
         sep.pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=2)
-        ttk.Button(btn_frame, text="重置选中", command=reset_selected).pack(side=tk.LEFT, padx=3)
-        ttk.Button(btn_frame, text="全部重置", command=reset_all).pack(side=tk.LEFT, padx=3)
-        ttk.Button(btn_frame, text="删除选中", command=delete_selected).pack(side=tk.LEFT, padx=3)
-        sep2 = ttk.Separator(btn_frame, orient=tk.VERTICAL)
-        sep2.pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=2)
-        ttk.Button(btn_frame, text="全选", command=select_all).pack(side=tk.LEFT, padx=3)
-        ttk.Button(btn_frame, text="取消选择", command=deselect_all).pack(side=tk.LEFT, padx=3)
-        ttk.Button(btn_frame, text="关闭", command=win.destroy).pack(side=tk.RIGHT, padx=3)
+        ttk.Button(btn_frame2, text="重置选中", command=reset_selected).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_frame2, text="全部重置", command=reset_all).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_frame2, text="删除选中", command=delete_selected).pack(side=tk.LEFT, padx=3)
 
     def _copy_tree_column(self, tree, column):
         """复制 Treeview 选中行的指定列到剪贴板。"""
