@@ -46,6 +46,11 @@ DEFAULT_CONFIG = {
     "grok2api_remote_app_key": "",
     "register_threads": 1,
     "thread_start_interval": 0.8,
+    "defaultDomains": "",
+
+    # ---- Outlook / Hotmail ----
+    "outlook_accounts": [],             # [{email, password, clientId, refreshToken, used, alias_used_count}]
+    "outlook_alias_max_per_account": 5, # 每账号最大别名数
 
     # ---- CPA (CLIProxyAPI) auth-file import ----
     # When enabled, after a successful registration we drive the xAI OAuth
@@ -560,7 +565,7 @@ def http_post(url, **kwargs):
 
 def raise_if_cancelled(cancel_callback=None):
     if cancel_callback and cancel_callback():
-        raise RegistrationCancelled("鐢ㄦ埛鍋滄娉ㄥ唽")
+        raise RegistrationCancelled("用户停止注册")
 
 
 def sleep_with_cancel(seconds, cancel_callback=None):
@@ -762,7 +767,7 @@ def yyds_create_account(address=None, domain=None, api_key=None, jwt=None):
     data = resp.json()
     if data.get("success"):
         return data.get("data", {})
-    raise Exception(f"YYDS 鍒涘缓閭澶辫触: {data}")
+    raise Exception(f"YYDS 创建邮箱失败: {data}")
 
 
 def yyds_get_token(address, api_key=None, jwt=None):
@@ -780,7 +785,7 @@ def yyds_get_token(address, api_key=None, jwt=None):
     data = resp.json()
     if data.get("success"):
         return data.get("data", {}).get("token")
-    raise Exception(f"YYDS 鑾峰彇token澶辫触: {data}")
+    raise Exception(f"YYDS 获取token失败: {data}")
 
 
 def yyds_get_messages(address, token=None, api_key=None, jwt=None):
@@ -816,7 +821,7 @@ def yyds_get_message_detail(message_id, token=None, api_key=None, jwt=None):
     data = resp.json()
     if data.get("success"):
         return data.get("data", {})
-    raise Exception(f"YYDS 鑾峰彇閭欢璇︽儏澶辫触: {data}")
+    raise Exception(f"YYDS 获取邮件详情失败: {data}")
 
 
 def yyds_generate_username(length=10):
@@ -827,7 +832,7 @@ def yyds_generate_username(length=10):
 def yyds_pick_domain(api_key=None, jwt=None):
     domains = yyds_get_domains(api_key=api_key, jwt=jwt)
     if not domains:
-        raise Exception("YYDS 娌℃湁杩斿洖浠讳綍鍙敤鍩熷悕")
+        raise Exception("YYDS 没有返回任何可用域名")
     private = [d for d in domains if d.get("isVerified") and not d.get("isPublic")]
     if private:
         return private[0]["domain"]
@@ -837,7 +842,7 @@ def yyds_pick_domain(api_key=None, jwt=None):
     verified = [d for d in domains if d.get("isVerified")]
     if verified:
         return verified[0]["domain"]
-    raise Exception("YYDS 鏃犲凡楠岃瘉鍩熷悕鍙敤")
+    raise Exception("YYDS 无可用已验证域名")
 
 
 def yyds_get_email_and_token(api_key=None, jwt=None):
@@ -855,8 +860,8 @@ def yyds_get_email_and_token(api_key=None, jwt=None):
     if not temp_token:
         temp_token = yyds_get_token(address, api_key=key, jwt=token)
     if not temp_token:
-        raise Exception("鑾峰彇 YYDS token 澶辫触")
-    print(f"[*] 宸插垱寤?YYDS 閭: {address}")
+        raise Exception("获取 YYDS token 失败")
+    print(f"[*] 已创建邮箱: YYDS 邮箱: {address}")
     return address, temp_token
 
 
@@ -877,7 +882,7 @@ def yyds_get_oai_code(
             messages = yyds_get_messages(address, token=token, jwt=jwt)
         except Exception as exc:
             if log_callback:
-                log_callback(f"[Debug] YYDS 鎷夊彇閭欢鍒楄〃澶辫触: {exc}")
+                log_callback(f"[Debug] YYDS 拉取邮件列表失败: {exc}")
             sleep_with_cancel(poll_interval, cancel_callback)
             continue
         for msg in messages:
@@ -892,7 +897,7 @@ def yyds_get_oai_code(
                 detail = yyds_get_message_detail(msg_id, token=token, jwt=jwt)
             except Exception as exc:
                 if log_callback:
-                    log_callback(f"[Debug] YYDS 鑾峰彇閭欢璇︽儏澶辫触: {exc}")
+                    log_callback(f"[Debug] YYDS 获取邮件详情失败: {exc}")
                 continue
             parts = []
             text_body = detail.get("text") or ""
@@ -904,7 +909,7 @@ def yyds_get_oai_code(
             combined = "\n".join(parts)
             subject = detail.get("subject", "")
             if log_callback:
-                log_callback(f"[Debug] YYDS 鏀跺埌閭欢: {subject}")
+                log_callback(f"[Debug] YYDS 收到邮件: {subject}")
             code = extract_verification_code(combined, subject)
             if code:
                 if log_callback:
@@ -922,7 +927,7 @@ def generate_username(length=10):
 def pick_domain(api_key=None):
     domains = get_domains(api_key=api_key)
     if not domains:
-        raise Exception("DuckMail 娌℃湁杩斿洖浠讳綍鍙敤鍩熷悕")
+        raise Exception("DuckMail 没有返回任何可用域名")
     private = [d for d in domains if d.get("ownerId")]
     verified_private = [d for d in private if d.get("isVerified")]
     if verified_private:
@@ -930,7 +935,168 @@ def pick_domain(api_key=None):
     public = [d for d in domains if d.get("isVerified")]
     if public:
         return public[0]["domain"]
-    raise Exception("DuckMail 鏃犲凡楠岃瘉鍩熷悕鍙敤")
+    raise Exception("DuckMail 无可用已验证域名")
+
+
+# ---- Outlook / Hotmail 邮箱 ----
+
+_outlook_account_locks = {}  # email -> threading.Lock
+_outlook_account_locks_guard = threading.Lock()
+_outlook_accounts_state_lock = threading.Lock()  # 保护 outlook_accounts 读写
+
+
+def _get_outlook_account_lock(email):
+    """获取某个 Outlook 账号的锁（惰性创建）。"""
+    with _outlook_account_locks_guard:
+        if email not in _outlook_account_locks:
+            _outlook_account_locks[email] = threading.Lock()
+        return _outlook_account_locks[email]
+
+def outlook_parse_import_text(raw_text):
+    """解析 Outlook 账号导入文本。
+    格式: email----password----clientId----refreshToken
+    返回 [{email, password, clientId, refreshToken}, ...]
+    """
+    lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
+    result = []
+    for i, line in enumerate(lines):
+        # 跳过表头行
+        if i == 0 and re.match(r'^账号.*密码.*ID.*Token', line, re.IGNORECASE):
+            continue
+        parts = [p.strip() for p in line.split('----')]
+        if len(parts) >= 4 and parts[0] and parts[2] and parts[3]:
+            result.append({
+                'email': parts[0],
+                'password': parts[1],
+                'clientId': parts[2],
+                'refreshToken': parts[3],
+                'used': False,
+                'alias_used_count': 0,
+            })
+    return result
+
+
+def outlook_pick_account():
+    """从 outlook_accounts 池中选一个可用账号 (LRU 策略)。"""
+    accounts = config.get('outlook_accounts', [])
+    candidates = [a for a in accounts if not a.get('used') and a.get('refreshToken')]
+    if not candidates:
+        raise Exception('Outlook 账号池无可用账号（全部已用或为空）')
+    candidates.sort(key=lambda a: a.get('lastUsedAt', 0))
+    return candidates[0]
+
+
+def outlook_pick_alias_base():
+    """从 outlook_accounts 池中选一个还有别名额度的基账号（跳过正在使用的）。"""
+    with _outlook_accounts_state_lock:
+        accounts = config.get('outlook_accounts', [])
+        max_alias = config.get('outlook_alias_max_per_account', 5)
+        candidates = [
+            a for a in accounts
+            if not a.get('used')
+            and a.get('refreshToken')
+            and a.get('alias_used_count', 0) < max_alias
+            and not _get_outlook_account_lock(a['email']).locked()
+        ]
+        if not candidates:
+            raise Exception('Outlook 账号池无可用别名基账号（全部用尽或正在使用）')
+        candidates.sort(key=lambda a: (a.get('alias_used_count', 0), a.get('lastUsedAt', 0)))
+        return candidates[0]
+
+
+def outlook_build_alias_email(base_email, tag):
+    """构建 Outlook +tag 别名邮箱: user+tag@outlook.com。"""
+    if '@' not in base_email:
+        raise Exception(f'Outlook 基邮箱格式错误: {base_email}')
+    local, domain = base_email.split('@', 1)
+    cleaned = re.sub(r'[^a-z0-9._-]+', '', tag.strip().lower())
+    cleaned = cleaned.strip('._-')
+    if not cleaned:
+        raise Exception('别名标签为空')
+    return f'{local}+{cleaned}@{domain}'
+
+
+def outlook_get_email_and_token():
+    """Outlook 模式获取邮箱地址。
+    直连模式: 返回 (email, account_dict)
+    别名模式: 返回 (alias_email, account_dict)
+    account_dict 同时作为 dev_token 传递给 get_oai_code。
+    别名模式下会锁定基账号，调用方必须在完成后调用 outlook_release_account。
+    """
+    is_alias = get_email_provider() == 'outlook-alias'
+
+    if is_alias:
+        account = outlook_pick_alias_base()
+        # 锁定该基账号，防止同一基账号的别名并发注册
+        lock = _get_outlook_account_lock(account['email'])
+        lock.acquire()
+        try:
+            with _outlook_accounts_state_lock:
+                tag = generate_username(8)
+                email = outlook_build_alias_email(account['email'], tag)
+                account['alias_used_count'] = account.get('alias_used_count', 0) + 1
+                account['lastUsedAt'] = time.time()
+            return email, account
+        except Exception:
+            lock.release()
+            raise
+    else:
+        with _outlook_accounts_state_lock:
+            account = outlook_pick_account()
+            account['used'] = True
+            account['lastUsedAt'] = time.time()
+        return account['email'], account
+
+
+def outlook_release_account(account):
+    """释放 Outlook 账号锁（别名模式用）。"""
+    if account and isinstance(account, dict) and account.get('email'):
+        lock = _outlook_account_locks.get(account['email'])
+        if lock and lock.locked():
+            lock.release()
+
+
+def outlook_get_oai_code(
+    dev_token,
+    email,
+    timeout=180,
+    poll_interval=5,
+    log_callback=None,
+    cancel_callback=None,
+):
+    """Outlook 模式获取验证码。dev_token 是 account_dict。"""
+    import microsoft_email
+
+    account = dev_token
+    if not isinstance(account, dict):
+        raise Exception('Outlook dev_token 格式错误')
+
+    client_id = account.get('clientId', '')
+    refresh_token = account.get('refreshToken', '')
+    if not client_id or not refresh_token:
+        raise Exception('Outlook 账号缺少 clientId 或 refreshToken')
+
+    def _on_rt_rotated(new_rt):
+        """Microsoft 轮转 refresh_token 时持久化。"""
+        account['refreshToken'] = new_rt
+        try:
+            save_config()
+        except Exception:
+            pass
+
+    code = microsoft_email.fetch_verification_code(
+        client_id=client_id,
+        refresh_token=refresh_token,
+        email=email,
+        max_retries=max(1, int(timeout / poll_interval)),
+        retry_delay=float(poll_interval),
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+        on_refresh_token_rotated=_on_rt_rotated,
+    )
+    if not code:
+        raise Exception(f'Outlook 验证码获取超时 ({timeout}s)')
+    return code
 
 
 def get_email_provider():
@@ -969,6 +1135,8 @@ def get_email_and_token(api_key=None):
             if not token:
                 raise Exception("获取 Cloudflare 邮箱 token 失败")
             return address, token
+    if provider in ("outlook", "outlook-alias"):
+        return outlook_get_email_and_token()
     key = api_key or get_duckmail_api_key()
     domain = pick_domain(api_key=key)
     username = generate_username(10)
@@ -977,7 +1145,7 @@ def get_email_and_token(api_key=None):
     create_account(address, password, api_key=key, expires_in=0)
     token = get_token(address, password)
     if not token:
-        raise Exception("鑾峰彇 DuckMail token 澶辫触")
+        raise Exception("获取 DuckMail token 失败")
     return address, token
 
 
@@ -1010,6 +1178,15 @@ def get_oai_code(
             log_callback=log_callback,
             cancel_callback=cancel_callback,
             resend_callback=resend_callback,
+        )
+    if provider in ("outlook", "outlook-alias"):
+        return outlook_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=5,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
         )
     return duckmail_get_oai_code(
         dev_token,
@@ -1057,7 +1234,7 @@ def duckmail_get_oai_code(
             messages = get_messages(dev_token)
         except Exception as exc:
             if log_callback:
-                log_callback(f"[Debug] 鎷夊彇閭欢鍒楄〃澶辫触: {exc}")
+                log_callback(f"[Debug] 拉取邮件列表失败: {exc}")
             sleep_with_cancel(poll_interval, cancel_callback)
             continue
         for msg in messages:
@@ -1072,7 +1249,7 @@ def duckmail_get_oai_code(
                 detail = get_message_detail(dev_token, msg_id)
             except Exception as exc:
                 if log_callback:
-                    log_callback(f"[Debug] 鑾峰彇閭欢璇︽儏澶辫触: {exc}")
+                    log_callback(f"[Debug] 获取邮件详情失败: {exc}")
                 continue
             parts = []
             text_body = detail.get("text") or ""
@@ -1084,7 +1261,7 @@ def duckmail_get_oai_code(
             combined = "\n".join(parts)
             subject = detail.get("subject", "")
             if log_callback:
-                log_callback(f"[Debug] 鏀跺埌閭欢: {subject}")
+                log_callback(f"[Debug] 收到邮件: {subject}")
             code = extract_verification_code(combined, subject)
             if code:
                 if log_callback:
@@ -1254,6 +1431,12 @@ def stop_browser():
             browser.quit(del_data=True)
         except Exception:
             pass
+        try:
+            # 确保底层进程已退出
+            if hasattr(browser, "_process") and browser._process:
+                browser._process.wait(timeout=5)
+        except Exception:
+            pass
     _set_browser(None)
     _set_page(None)
 
@@ -1380,9 +1563,9 @@ def fill_email_and_submit(timeout=15, log_callback=None, cancel_callback=None):
     raise_if_cancelled(cancel_callback)
     email, dev_token = get_email_and_token()
     if not email or not dev_token:
-        raise Exception("鑾峰彇閭澶辫触")
+        raise Exception("获取邮箱失败")
     if log_callback:
-        log_callback(f"[*] 宸插垱寤洪偖绠? {email}")
+        log_callback(f"[*] 已创建邮箱: {email}")
     deadline = time.time() + timeout
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -2090,7 +2273,7 @@ class GrokRegisterGUI:
         config_frame.pack(fill=tk.X, pady=5)
         ttk.Label(config_frame, text="邮箱服务商:").grid(row=0, column=0, sticky=tk.W)
         self.email_provider_var = tk.StringVar(value=config.get("email_provider", "duckmail"))
-        self.email_provider_combo = ttk.Combobox(config_frame, textvariable=self.email_provider_var, values=["duckmail", "yyds", "cloudflare"], width=12, state="readonly")
+        self.email_provider_combo = ttk.Combobox(config_frame, textvariable=self.email_provider_var, values=["duckmail", "yyds", "cloudflare", "outlook", "outlook-alias"], width=12, state="readonly")
         self.email_provider_combo.grid(row=0, column=1, sticky=tk.W, padx=5)
         ttk.Label(config_frame, text="注册数量:").grid(row=0, column=2, sticky=tk.W, padx=10)
         self.count_var = tk.StringVar(value=str(config.get("register_count", 1)))
@@ -2098,7 +2281,7 @@ class GrokRegisterGUI:
         self.count_spinbox.grid(row=0, column=3, sticky=tk.W, padx=5)
         ttk.Label(config_frame, text="并发线程:").grid(row=1, column=2, sticky=tk.W, padx=10)
         self.thread_var = tk.StringVar(value=str(config.get("register_threads", 1)))
-        self.thread_spinbox = ttk.Spinbox(config_frame, from_=1, to=10, width=8, textvariable=self.thread_var)
+        self.thread_spinbox = ttk.Spinbox(config_frame, from_=1, to=50, width=8, textvariable=self.thread_var)
         self.thread_spinbox.grid(row=1, column=3, sticky=tk.W, padx=5)
         ttk.Label(config_frame, text="代理（可选）:").grid(row=2, column=0, sticky=tk.W)
         self.proxy_var = tk.StringVar(value=config.get("proxy", ""))
@@ -2207,6 +2390,22 @@ class GrokRegisterGUI:
         self.cpa_records_dir_var = tk.StringVar(value=str(config.get("cpa_records_dir", "cpa_records")))
         self.cpa_records_dir_entry = ttk.Entry(config_frame, textvariable=self.cpa_records_dir_var, width=18)
         self.cpa_records_dir_entry.grid(row=18, column=3, sticky=tk.W, padx=5)
+
+        # ---- Outlook / Hotmail 配置 ----
+        outlook_accounts = config.get("outlook_accounts", [])
+        ttk.Label(config_frame, text="Outlook 账号池:").grid(row=19, column=0, sticky=tk.W)
+        outlook_btn_frame = ttk.Frame(config_frame)
+        outlook_btn_frame.grid(row=19, column=1, sticky=tk.W, padx=5)
+        self.outlook_import_btn = ttk.Button(outlook_btn_frame, text="导入", command=self.outlook_import_accounts_dialog)
+        self.outlook_import_btn.pack(side=tk.LEFT, padx=(0, 3))
+        self.outlook_manage_btn = ttk.Button(outlook_btn_frame, text="管理", command=self.outlook_manage_accounts_dialog)
+        self.outlook_manage_btn.pack(side=tk.LEFT)
+        self.outlook_count_label = ttk.Label(config_frame, text=f"已导入 {len(outlook_accounts)} 个")
+        self.outlook_count_label.grid(row=19, column=2, sticky=tk.W, padx=10)
+        ttk.Label(config_frame, text="别名上限:").grid(row=19, column=3, sticky=tk.W, padx=5)
+        self.outlook_alias_max_var = tk.StringVar(value=str(config.get("outlook_alias_max_per_account", 5)))
+        self.outlook_alias_max_spinbox = ttk.Spinbox(config_frame, from_=1, to=50, width=6, textvariable=self.outlook_alias_max_var)
+        self.outlook_alias_max_spinbox.grid(row=19, column=4, sticky=tk.W, padx=2)
 
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X, pady=10)
@@ -2384,6 +2583,150 @@ class GrokRegisterGUI:
             os.path.dirname(__file__), f"accounts_{date_str}.txt"
         )
 
+    def outlook_import_accounts_dialog(self):
+        """弹出 Outlook 账号导入对话框。"""
+        win = tk.Toplevel(self.root)
+        win.title("导入 Outlook 账号")
+        win.geometry("600x450")
+        win.transient(self.root)
+        win.grab_set()
+
+        ttk.Label(win, text="格式: email----password----clientId----refreshToken（每行一个）").pack(anchor=tk.W, padx=10, pady=(10, 0))
+        text_widget = scrolledtext.ScrolledText(win, width=70, height=18)
+        text_widget.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        # 预填已有账号
+        existing = config.get("outlook_accounts", [])
+        if existing:
+            lines = [f"{a['email']}----{a.get('password','')}----{a.get('clientId','')}----{a.get('refreshToken','')}" for a in existing]
+            text_widget.insert(tk.END, "\n".join(lines))
+
+        result_box = ttk.Label(win, text="")
+        result_box.pack(anchor=tk.W, padx=10)
+
+        def do_import():
+            raw = text_widget.get("1.0", tk.END)
+            parsed = outlook_parse_import_text(raw)
+            if not parsed:
+                result_box.config(text="未解析到有效账号，请检查格式")
+                return
+            # 合并：保留已有账号，新增不重复的
+            existing_map = {a["email"].lower(): a for a in config.get("outlook_accounts", [])}
+            added = 0
+            for a in parsed:
+                key = a["email"].lower()
+                if key not in existing_map:
+                    existing_map[key] = a
+                    added += 1
+            config["outlook_accounts"] = list(existing_map.values())
+            save_config()
+            self.outlook_count_label.config(text=f"已导入 {len(config['outlook_accounts'])} 个")
+            result_box.config(text=f"完成：新增 {added} 个，总计 {len(config['outlook_accounts'])} 个")
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Button(btn_frame, text="导入", command=do_import).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="关闭", command=win.destroy).pack(side=tk.LEFT, padx=5)
+
+    def outlook_manage_accounts_dialog(self):
+        """Outlook 账号管理弹窗：查看状态、重置、删除。"""
+        win = tk.Toplevel(self.root)
+        win.title("管理 Outlook 账号")
+        win.geometry("750x420")
+        win.transient(self.root)
+        win.grab_set()
+
+        accounts = config.get("outlook_accounts", [])
+        provider = config.get("email_provider", "duckmail")
+        is_alias = provider == "outlook-alias"
+        max_alias = config.get("outlook_alias_max_per_account", 5)
+
+        # 顶部信息
+        info_text = f"共 {len(accounts)} 个账号"
+        if is_alias:
+            info_text += f"  |  模式: 别名  |  每账号上限: {max_alias}"
+        else:
+            info_text += "  |  模式: 直连"
+        ttk.Label(win, text=info_text).pack(anchor=tk.W, padx=10, pady=(10, 5))
+
+        # Treeview 表格
+        columns = ("email", "status", "used", "aliases", "info")
+        tree = ttk.Treeview(win, columns=columns, show="headings", height=12)
+        tree.heading("email", text="邮箱")
+        tree.heading("status", text="状态")
+        tree.heading("used", text="已用" if not is_alias else "用尽")
+        tree.heading("aliases", text="别名数")
+        tree.heading("info", text="备注")
+        tree.column("email", width=220)
+        tree.column("status", width=60, anchor=tk.CENTER)
+        tree.column("used", width=50, anchor=tk.CENTER)
+        tree.column("aliases", width=60, anchor=tk.CENTER)
+        tree.column("info", width=180)
+        scrollbar = ttk.Scrollbar(win, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0), pady=5)
+        scrollbar.pack(side=tk.LEFT, fill=tk.Y, pady=5, padx=(0, 10))
+
+        def refresh_tree():
+            for item in tree.get_children():
+                tree.delete(item)
+            for a in config.get("outlook_accounts", []):
+                used = a.get("used", False)
+                alias_count = a.get("alias_used_count", 0)
+                has_rt = bool(a.get("refreshToken"))
+                if is_alias:
+                    status = "可用" if has_rt and alias_count < max_alias else ("用尽" if alias_count >= max_alias else "无Token")
+                    used_text = "是" if alias_count >= max_alias else "否"
+                    alias_text = f"{alias_count}/{max_alias}"
+                else:
+                    status = "可用" if has_rt and not used else ("已用" if used else "无Token")
+                    used_text = "是" if used else "否"
+                    alias_text = "-"
+                info = ""
+                if not has_rt:
+                    info = "缺少 refreshToken"
+                tree.insert("", tk.END, iid=a.get("email", ""), values=(
+                    a.get("email", ""), status, used_text, alias_text, info
+                ))
+
+        refresh_tree()
+
+        # 底部按钮
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        def reset_selected():
+            for iid in tree.selection():
+                for a in config.get("outlook_accounts", []):
+                    if a.get("email") == iid:
+                        a["used"] = False
+                        a["alias_used_count"] = 0
+                        break
+            save_config()
+            refresh_tree()
+            self.outlook_count_label.config(text=f"已导入 {len(config['outlook_accounts'])} 个")
+
+        def reset_all():
+            for a in config.get("outlook_accounts", []):
+                a["used"] = False
+                a["alias_used_count"] = 0
+            save_config()
+            refresh_tree()
+
+        def delete_selected():
+            selected = set(tree.selection())
+            if not selected:
+                return
+            config["outlook_accounts"] = [a for a in config.get("outlook_accounts", []) if a.get("email") not in selected]
+            save_config()
+            refresh_tree()
+            self.outlook_count_label.config(text=f"已导入 {len(config['outlook_accounts'])} 个")
+
+        ttk.Button(btn_frame, text="重置选中", command=reset_selected).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="全部重置", command=reset_all).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="删除选中", command=delete_selected).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="关闭", command=win.destroy).pack(side=tk.RIGHT, padx=5)
+
     def start_registration(self):
         if self.is_running:
             self.log("[!] 当前已有任务在运行")
@@ -2412,7 +2755,15 @@ class GrokRegisterGUI:
         except Exception:
             config["cpa_timeout_s"] = 240
         try:
-            config["register_threads"] = max(1, min(10, int(self.thread_var.get())))
+            config["outlook_alias_max_per_account"] = max(1, min(50, int(self.outlook_alias_max_var.get())))
+        except Exception:
+            config["outlook_alias_max_per_account"] = 5
+        try:
+            config["register_count"] = max(1, int(self.count_var.get()))
+        except Exception:
+            config["register_count"] = 1
+        try:
+            config["register_threads"] = max(1, min(50, int(self.thread_var.get())))
         except Exception:
             config["register_threads"] = 1
         raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]
@@ -2425,11 +2776,10 @@ class GrokRegisterGUI:
         if config["email_provider"] == "cloudflare" and not config["cloudflare_api_base"]:
             self.log("[!] Cloudflare 模式需要先填写 Cloudflare API Base")
             return
-        try:
-            count = int(self.count_var.get())
-        except Exception:
-            self.log("[!] 注册数量无效")
+        if config["email_provider"] in ("outlook", "outlook-alias") and not config.get("outlook_accounts"):
+            self.log("[!] Outlook 模式需要先导入 Outlook 账号")
             return
+        count = config["register_count"]
         self.stop_requested = False
         self.success_count = 0
         self.fail_count = 0
@@ -2456,30 +2806,35 @@ class GrokRegisterGUI:
         code = ""
         mail_ok = False
         max_mail_retry = 3
-        for mail_try in range(1, max_mail_retry + 1):
-            logf(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
-            open_signup_page(log_callback=logf, cancel_callback=self.should_stop)
-            logf("[*] 2. 创建邮箱并提交")
-            email, dev_token = fill_email_and_submit(log_callback=logf, cancel_callback=self.should_stop)
-            logf(f"[*] 邮箱: {email}")
-            try:
-                with open(os.path.join(os.path.dirname(__file__), "mail_credentials.txt"), "a", encoding="utf-8") as f:
-                    f.write(f"{email}\t{dev_token}\n")
-            except Exception:
-                pass
-            logf("[*] 3. 拉取验证码")
-            try:
-                code = fill_code_and_submit(email, dev_token, log_callback=logf, cancel_callback=self.should_stop)
-                mail_ok = True
-                break
-            except Exception as mail_exc:
-                msg = str(mail_exc)
-                if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
-                    logf(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
-                    restart_browser(log_callback=logf)
-                    sleep_with_cancel(1, self.should_stop)
-                    continue
-                raise
+        try:
+            for mail_try in range(1, max_mail_retry + 1):
+                logf(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
+                open_signup_page(log_callback=logf, cancel_callback=self.should_stop)
+                logf("[*] 2. 创建邮箱并提交")
+                # 释放上一轮的账号锁（重试场景）
+                if dev_token and isinstance(dev_token, dict):
+                    outlook_release_account(dev_token)
+                email, dev_token = fill_email_and_submit(log_callback=logf, cancel_callback=self.should_stop)
+                logf(f"[*] 邮箱: {email}")
+                logf("[*] 3. 拉取验证码")
+                try:
+                    code = fill_code_and_submit(email, dev_token, log_callback=logf, cancel_callback=self.should_stop)
+                    mail_ok = True
+                    break
+                except Exception as mail_exc:
+                    msg = str(mail_exc)
+                    if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
+                        if self.should_stop():
+                            raise Exception("用户停止注册")
+                        logf(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
+                        restart_browser(log_callback=logf)
+                        sleep_with_cancel(1, self.should_stop)
+                        continue
+                    raise
+        finally:
+            # 释放 Outlook 账号锁（别名模式）
+            if dev_token and isinstance(dev_token, dict):
+                outlook_release_account(dev_token)
         if not mail_ok:
             raise Exception("验证码阶段失败，已达到最大重试次数")
         logf(f"[*] 验证码: {code}")
@@ -2536,7 +2891,7 @@ class GrokRegisterGUI:
                     logf(f"[-] 注册失败: {exc}")
                 finally:
                     self.update_stats()
-                    if self.should_stop():
+                    if self.should_stop() or task_queue.empty():
                         break
                     restart_browser(log_callback=logf)
                     sleep_with_cancel(1, self.should_stop)
@@ -2570,6 +2925,26 @@ class GrokRegisterGUI:
 def main():
     root = tk.Tk()
     app = GrokRegisterGUI(root)
+
+    def on_app_close():
+        # Save current GUI values to config before exiting
+        try:
+            config["register_count"] = max(1, int(app.count_var.get()))
+        except Exception:
+            pass
+        try:
+            config["register_threads"] = max(1, min(50, int(app.thread_var.get())))
+        except Exception:
+            pass
+        try:
+            config["outlook_alias_max_per_account"] = max(1, min(50, int(app.outlook_alias_max_var.get())))
+        except Exception:
+            pass
+        config["defaultDomains"] = app.default_domains_var.get().strip()
+        save_config()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_app_close)
     root.mainloop()
 
 

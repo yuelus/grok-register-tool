@@ -20,5 +20,7 @@
   "defaultDomains": "298997309.xyz",
   "email_provider": "cloudflare",
   "yyds_api_key": "",
-  "yyds_jwt": ""
+  "yyds_jwt": "",
+  "outlook_accounts": [],
+  "outlook_alias_max_per_account": 5
 }
