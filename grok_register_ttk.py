@@ -2658,9 +2658,18 @@ class GrokRegisterGUI:
         search_entry = ttk.Entry(top_frame, textvariable=search_var, width=25)
         search_entry.pack(side=tk.LEFT)
 
+        # --- 按钮区（在列表上方） ---
+        btn_frame1 = ttk.Frame(win)
+        btn_frame1.pack(fill=tk.X, padx=10, pady=(5, 2))
+        btn_frame2 = ttk.Frame(win)
+        btn_frame2.pack(fill=tk.X, padx=10, pady=(0, 5))
+
         # --- Treeview 表格 ---
+        tree_frame = ttk.Frame(win)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
         columns = ("email", "password", "clientId", "refreshToken", "status", "used", "aliases")
-        tree = ttk.Treeview(win, columns=columns, show="headings", height=15, selectmode="extended")
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=15, selectmode="extended")
         tree.heading("email", text="邮箱")
         tree.heading("password", text="密码")
         tree.heading("clientId", text="ClientId")
@@ -2676,10 +2685,10 @@ class GrokRegisterGUI:
         tree.column("used", width=40, anchor=tk.CENTER)
         tree.column("aliases", width=50, anchor=tk.CENTER)
 
-        scrollbar = ttk.Scrollbar(win, orient=tk.VERTICAL, command=tree.yview)
+        scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
-        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0), pady=5)
-        scrollbar.pack(side=tk.LEFT, fill=tk.Y, pady=5, padx=(0, 10))
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.LEFT, fill=tk.Y)
 
         def _filter_accounts():
             """根据搜索框过滤账号列表。"""
@@ -2741,11 +2750,10 @@ class GrokRegisterGUI:
 
         tree.bind("<Button-3>", show_context_menu)
 
-        # --- 底部按钮（两行） ---
-        btn_frame1 = ttk.Frame(win)
-        btn_frame1.pack(fill=tk.X, padx=10, pady=(10, 2))
-        btn_frame2 = ttk.Frame(win)
-        btn_frame2.pack(fill=tk.X, padx=10, pady=(0, 5))
+        # --- 底部：关闭按钮 ---
+        bottom_frame = ttk.Frame(win)
+        bottom_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
+        ttk.Button(bottom_frame, text="关闭", command=win.destroy).pack(side=tk.RIGHT, padx=3)
 
         def add_single():
             """添加单个账号。"""
@@ -2905,7 +2913,6 @@ class GrokRegisterGUI:
         ttk.Button(btn_frame1, text="导入", command=open_import).pack(side=tk.LEFT, padx=3)
         ttk.Button(btn_frame1, text="编辑", command=edit_selected).pack(side=tk.LEFT, padx=3)
         ttk.Button(btn_frame1, text="导出", command=export_accounts).pack(side=tk.LEFT, padx=3)
-        ttk.Button(btn_frame1, text="关闭", command=win.destroy).pack(side=tk.RIGHT, padx=3)
 
         # 第二行：全选、取消选择、重置选中、全部重置、删除选中
         ttk.Button(btn_frame2, text="全选", command=select_all).pack(side=tk.LEFT, padx=3)
