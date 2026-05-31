@@ -2664,12 +2664,15 @@ class GrokRegisterGUI:
         btn_frame2 = ttk.Frame(win)
         btn_frame2.pack(fill=tk.X, padx=10, pady=(0, 5))
 
-        # --- Treeview 表格 ---
+        # --- Treeview 表格（带勾选框） ---
         tree_frame = ttk.Frame(win)
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        columns = ("email", "password", "clientId", "refreshToken", "status", "used", "aliases")
-        tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=15, selectmode="extended")
+        checked = {}  # email -> bool，勾选状态
+
+        columns = ("sel", "email", "password", "clientId", "refreshToken", "status", "used", "aliases")
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=15)
+        tree.heading("sel", text="☑")
         tree.heading("email", text="邮箱")
         tree.heading("password", text="密码")
         tree.heading("clientId", text="ClientId")
@@ -2677,13 +2680,14 @@ class GrokRegisterGUI:
         tree.heading("status", text="状态")
         tree.heading("used", text="已用" if not is_alias else "用尽")
         tree.heading("aliases", text="别名数")
-        tree.column("email", width=180)
-        tree.column("password", width=60)
-        tree.column("clientId", width=100)
-        tree.column("refreshToken", width=120)
-        tree.column("status", width=55, anchor=tk.CENTER)
-        tree.column("used", width=40, anchor=tk.CENTER)
-        tree.column("aliases", width=50, anchor=tk.CENTER)
+        tree.column("sel", width=30, anchor=tk.CENTER)
+        tree.column("email", width=170)
+        tree.column("password", width=55)
+        tree.column("clientId", width=95)
+        tree.column("refreshToken", width=110)
+        tree.column("status", width=50, anchor=tk.CENTER)
+        tree.column("used", width=35, anchor=tk.CENTER)
+        tree.column("aliases", width=45, anchor=tk.CENTER)
 
         scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
@@ -2700,6 +2704,7 @@ class GrokRegisterGUI:
             for item in tree.get_children():
                 tree.delete(item)
             for a in _filter_accounts():
+                email = a.get("email", "")
                 used = a.get("used", False)
                 alias_count = a.get("alias_used_count", 0)
                 has_rt = bool(a.get("refreshToken"))
@@ -2711,8 +2716,10 @@ class GrokRegisterGUI:
                     status = "可用" if has_rt and not used else ("已用" if used else "无Token")
                     used_text = "是" if used else "否"
                     alias_text = "-"
-                tree.insert("", tk.END, iid=a.get("email", ""), values=(
-                    a.get("email", ""),
+                mark = "☑" if checked.get(email, False) else "☐"
+                tree.insert("", tk.END, iid=email, values=(
+                    mark,
+                    email,
                     a.get("password", ""),
                     a.get("clientId", ""),
                     a.get("refreshToken", ""),
@@ -2720,9 +2727,12 @@ class GrokRegisterGUI:
                 ))
             total = len(config.get("outlook_accounts", []))
             filtered = len(tree.get_children())
+            chk_count = sum(1 for v in checked.values() if v)
             info = f"共 {total} 个账号"
             if filtered < total:
                 info += f"  (显示 {filtered} 个)"
+            if chk_count > 0:
+                info += f"  |  已勾选 {chk_count} 个"
             if is_alias:
                 info += f"  |  别名模式  |  每账号上限: {max_alias}"
             else:
@@ -2734,6 +2744,39 @@ class GrokRegisterGUI:
         search_var.trace_add("write", on_search)
         refresh_tree()
 
+        # --- 点击勾选框切换 ---
+        def toggle_check(event):
+            """点击行时切换勾选状态。"""
+            iid = tree.identify_row(event.y)
+            if not iid:
+                return
+            col = tree.identify_column(event.x)
+            # 点击第一列（#0 或 #1）时切换，或者任意列都行（方便操作）
+            checked[iid] = not checked.get(iid, False)
+            vals = list(tree.item(iid, "values"))
+            vals[0] = "☑" if checked[iid] else "☐"
+            tree.item(iid, values=vals)
+            # 更新信息栏
+            chk_count = sum(1 for v in checked.values() if v)
+            total = len(config.get("outlook_accounts", []))
+            filtered = len(tree.get_children())
+            info = f"共 {total} 个账号"
+            if filtered < total:
+                info += f"  (显示 {filtered} 个)"
+            if chk_count > 0:
+                info += f"  |  已勾选 {chk_count} 个"
+            if is_alias:
+                info += f"  |  别名模式  |  每账号上限: {max_alias}"
+            else:
+                info += "  |  直连模式"
+            self.outlook_manage_info_label.config(text=info)
+
+        tree.bind("<ButtonRelease-1>", toggle_check)
+
+        def _get_checked_emails():
+            """返回所有已勾选的邮箱列表。"""
+            return [email for email, chk in checked.items() if chk]
+
         # --- 右键菜单 ---
         context_menu = tk.Menu(win, tearoff=0)
         context_menu.add_command(label="编辑选中", command=lambda: edit_selected())
@@ -2744,8 +2787,11 @@ class GrokRegisterGUI:
 
         def show_context_menu(event):
             iid = tree.identify_row(event.y)
-            if iid and iid not in tree.selection():
-                tree.selection_set(iid)
+            if iid and not checked.get(iid, False):
+                checked[iid] = True
+                vals = list(tree.item(iid, "values"))
+                vals[0] = "☑"
+                tree.item(iid, values=vals)
             context_menu.tk_popup(event.x_root, event.y_root)
 
         tree.bind("<Button-3>", show_context_menu)
@@ -2795,8 +2841,8 @@ class GrokRegisterGUI:
             ttk.Button(dlg, text="添加", command=do_add).grid(row=len(fields), column=0, columnspan=2, pady=10)
 
         def edit_selected():
-            """编辑选中的账号。"""
-            selected = tree.selection()
+            """编辑勾选的账号（只编辑第一个）。"""
+            selected = _get_checked_emails()
             if not selected:
                 return
             email = selected[0]
@@ -2839,15 +2885,15 @@ class GrokRegisterGUI:
             ttk.Button(dlg, text="保存", command=do_save).grid(row=len(fields), column=0, columnspan=2, pady=10)
 
         def reset_selected():
-            for iid in tree.selection():
-                for a in config.get("outlook_accounts", []):
-                    if a.get("email") == iid:
-                        a["used"] = False
-                        a["alias_used_count"] = 0
-                        break
+            selected = set(_get_checked_emails())
+            if not selected:
+                return
+            for a in config.get("outlook_accounts", []):
+                if a.get("email") in selected:
+                    a["used"] = False
+                    a["alias_used_count"] = 0
             save_config()
             refresh_tree()
-            self.outlook_count_label.config(text=f"已导入 {len(config['outlook_accounts'])} 个")
 
         def reset_all():
             for a in config.get("outlook_accounts", []):
@@ -2857,22 +2903,50 @@ class GrokRegisterGUI:
             refresh_tree()
 
         def delete_selected():
-            selected = set(tree.selection())
+            selected = set(_get_checked_emails())
             if not selected:
                 return
             count = len(selected)
-            if not messagebox.askyesno("确认删除", f"确定删除选中的 {count} 个账号？"):
+            if not messagebox.askyesno("确认删除", f"确定删除勾选的 {count} 个账号？"):
                 return
             config["outlook_accounts"] = [a for a in config.get("outlook_accounts", []) if a.get("email") not in selected]
+            # 清理已删除的勾选记录
+            for email in selected:
+                checked.pop(email, None)
             save_config()
             refresh_tree()
             self.outlook_count_label.config(text=f"已导入 {len(config['outlook_accounts'])} 个")
 
         def select_all():
-            tree.selection_set(tree.get_children())
+            for iid in tree.get_children():
+                checked[iid] = True
+                vals = list(tree.item(iid, "values"))
+                vals[0] = "☑"
+                tree.item(iid, values=vals)
+            # 更新信息
+            chk_count = sum(1 for v in checked.values() if v)
+            total = len(config.get("outlook_accounts", []))
+            info = f"共 {total} 个账号  |  已勾选 {chk_count} 个"
+            if is_alias:
+                info += f"  |  别名模式  |  每账号上限: {max_alias}"
+            else:
+                info += "  |  直连模式"
+            self.outlook_manage_info_label.config(text=info)
 
         def deselect_all():
-            tree.selection_remove(*tree.selection())
+            for email in list(checked.keys()):
+                checked[email] = False
+            for iid in tree.get_children():
+                vals = list(tree.item(iid, "values"))
+                vals[0] = "☐"
+                tree.item(iid, values=vals)
+            total = len(config.get("outlook_accounts", []))
+            info = f"共 {total} 个账号"
+            if is_alias:
+                info += f"  |  别名模式  |  每账号上限: {max_alias}"
+            else:
+                info += "  |  直连模式"
+            self.outlook_manage_info_label.config(text=info)
 
         def export_accounts():
             """导出账号到文本框。"""
@@ -2924,16 +2998,16 @@ class GrokRegisterGUI:
         ttk.Button(btn_frame2, text="删除选中", command=delete_selected).pack(side=tk.LEFT, padx=3)
 
     def _copy_tree_column(self, tree, column):
-        """复制 Treeview 选中行的指定列到剪贴板。"""
-        selected = tree.selection()
-        if not selected:
+        """复制 Treeview 勾选行的指定列到剪贴板。"""
+        col_idx = tree["columns"].index(column) if column in tree["columns"] else -1
+        if col_idx < 0:
             return
         values = []
-        for iid in selected:
+        for iid in tree.get_children():
             item = tree.item(iid)
-            col_idx = tree["columns"].index(column) if column in tree["columns"] else -1
-            if col_idx >= 0 and item.get("values"):
-                values.append(str(item["values"][col_idx]))
+            vals = item.get("values", [])
+            if vals and vals[0] == "☑":
+                values.append(str(vals[col_idx]))
         if values:
             self.root.clipboard_clear()
             self.root.clipboard_append("\n".join(values))
