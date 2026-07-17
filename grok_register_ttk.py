@@ -44,6 +44,11 @@ DEFAULT_CONFIG = {
     "grok2api_auto_add_remote": False,
     "grok2api_remote_base": "",
     "grok2api_remote_app_key": "",
+    "grok2api_auto_import_system": False,
+    "grok2api_system_admin_username": "admin",
+    "grok2api_system_admin_password": "",
+    "grok2api_system_provider": "all",
+    "grok2api_system_web_tier": "auto",
     "register_threads": 1,
     "thread_start_interval": 0.8,
     "defaultDomains": "",
@@ -68,6 +73,8 @@ DEFAULT_CONFIG = {
 
 config = DEFAULT_CONFIG.copy()
 _cf_domain_index = 0
+_grok2api_admin_token_cache = {"base": "", "username": "", "token": "", "expires_at": 0.0}
+_grok2api_admin_token_lock = threading.Lock()
 
 
 class RegistrationCancelled(Exception):
@@ -361,6 +368,328 @@ def _grok2api_admin_auth(app_key):
     return headers, query
 
 
+def _normalize_grok2api_base(raw_base):
+    base = str(raw_base or "").strip().rstrip("/")
+    if not base:
+        return ""
+    if "://" not in base:
+        base = "http://" + base
+    # 常见误写：192.168.1.160::8010
+    base = re.sub(r"(?<=\d)::(?=\d)", ":", base)
+    return base.rstrip("/")
+
+
+def _grok2api_v1_url(base, path):
+    base = _normalize_grok2api_base(base)
+    path = "/" + path.lstrip("/")
+    if base.endswith("/api/admin/v1"):
+        return f"{base}{path}"
+    return f"{base}/api/admin/v1{path}"
+
+
+def _pick_grok2api_system_password():
+    password = str(config.get("grok2api_system_admin_password", "") or "").strip()
+    if password:
+        return password
+    # 兼容用户已经把后台密码填在旧版 app_key 输入框里的配置。
+    return str(config.get("grok2api_remote_app_key", "") or "").strip()
+
+
+def _pick_grok2api_system_provider():
+    provider = str(config.get("grok2api_system_provider", "all") or "all").strip().lower()
+    if provider in ("build", "web+console+build"):
+        provider = "all"
+    if provider not in ("all", "web", "console"):
+        provider = "all"
+    return provider
+
+
+def _pick_grok2api_system_web_tier():
+    tier = str(config.get("grok2api_system_web_tier", "auto") or "auto").strip().lower()
+    if tier not in ("auto", "basic", "super", "heavy"):
+        tier = "auto"
+    return tier
+
+
+def _parse_grok2api_datetime(raw_value, default_ttl=600):
+    if not raw_value:
+        return time.time() + default_ttl
+    try:
+        value = str(raw_value).replace("Z", "+00:00")
+        dt = datetime.datetime.fromisoformat(value)
+        return dt.timestamp()
+    except Exception:
+        return time.time() + default_ttl
+
+
+def get_grok2api_system_access_token(base, username, password):
+    base = _normalize_grok2api_base(base)
+    username = str(username or "").strip() or "admin"
+    password = str(password or "").strip()
+    if not base or not username or not password:
+        raise Exception("grok2api 系统账号导入需要配置 Base、管理员用户名和密码")
+
+    with _grok2api_admin_token_lock:
+        cached = _grok2api_admin_token_cache
+        if (
+            cached.get("base") == base
+            and cached.get("username") == username
+            and cached.get("token")
+            and float(cached.get("expires_at") or 0) > time.time() + 60
+        ):
+            return cached["token"]
+
+        url = _grok2api_v1_url(base, "/auth/login")
+        resp = http_post(
+            url,
+            headers={"Content-Type": "application/json"},
+            json={"username": username, "password": password},
+            timeout=30,
+            proxies={},
+        )
+        try:
+            resp.raise_for_status()
+        except Exception as exc:
+            raise Exception(f"grok2api 管理登录失败: {exc} {getattr(resp, 'text', '')[:300]}")
+        try:
+            payload = resp.json()
+        except Exception:
+            raise Exception(f"grok2api 管理登录返回非 JSON: {resp.text[:300]}")
+        data = payload.get("data", payload) if isinstance(payload, dict) else {}
+        tokens = data.get("tokens", {}) if isinstance(data, dict) else {}
+        access_token = str(tokens.get("accessToken", "") or "").strip()
+        if not access_token:
+            raise Exception(f"grok2api 管理登录未返回 accessToken: {str(payload)[:300]}")
+        _grok2api_admin_token_cache.update(
+            {
+                "base": base,
+                "username": username,
+                "token": access_token,
+                "expires_at": _parse_grok2api_datetime(tokens.get("accessTokenExpiresAt")),
+            }
+        )
+        return access_token
+
+
+def _parse_grok2api_event_stream(text):
+    events = []
+    current = {"event": "message", "data": []}
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.rstrip("\r")
+        if not line:
+            if current["data"]:
+                events.append((current["event"], "\n".join(current["data"])))
+            current = {"event": "message", "data": []}
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            current["event"] = line.split(":", 1)[1].strip()
+        elif line.startswith("data:"):
+            current["data"].append(line.split(":", 1)[1].strip())
+    if current["data"]:
+        events.append((current["event"], "\n".join(current["data"])))
+
+    last_error = None
+    for event, data in events:
+        if not data:
+            continue
+        try:
+            payload = json.loads(data)
+        except Exception:
+            payload = {"raw": data}
+        if event == "error":
+            last_error = payload
+        elif event == "complete":
+            return payload
+    if last_error:
+        message = last_error.get("message") if isinstance(last_error, dict) else str(last_error)
+        raise Exception(message or "grok2api 导入失败")
+
+    try:
+        payload = json.loads(text)
+        return payload.get("data", payload) if isinstance(payload, dict) else payload
+    except Exception:
+        return {}
+
+
+def _format_grok2api_task_result(result):
+    if not isinstance(result, dict):
+        return ""
+    keys = ("created", "updated", "linked", "skipped", "failed", "synced", "syncFailed")
+    parts = []
+    for key in keys:
+        if key in result:
+            try:
+                value = int(result.get(key, 0) or 0)
+            except Exception:
+                value = result.get(key)
+            parts.append(f"{key}={value}")
+    return ", ".join(parts)
+
+
+def _grok2api_post_json_task(base, access_token, path, payload, timeout=300):
+    resp = http_post(
+        _grok2api_v1_url(base, path),
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=timeout,
+        proxies={},
+    )
+    try:
+        resp.raise_for_status()
+    except Exception as exc:
+        raise Exception(f"grok2api 任务失败 {path}: {exc} {getattr(resp, 'text', '')[:300]}")
+    return _parse_grok2api_event_stream(resp.text)
+
+
+def _grok2api_get_json(base, access_token, path, params=None, timeout=30):
+    resp = http_get(
+        _grok2api_v1_url(base, path),
+        headers={"Authorization": f"Bearer {access_token}"},
+        params=params or {},
+        timeout=timeout,
+        proxies={},
+    )
+    try:
+        resp.raise_for_status()
+    except Exception as exc:
+        raise Exception(f"grok2api 查询失败 {path}: {exc} {getattr(resp, 'text', '')[:300]}")
+    try:
+        payload = resp.json()
+    except Exception:
+        raise Exception(f"grok2api 查询返回非 JSON {path}: {resp.text[:300]}")
+    return payload.get("data", payload) if isinstance(payload, dict) else payload
+
+
+def _grok2api_find_account_id(base, access_token, provider, name):
+    name = str(name or "").strip()
+    if not name:
+        return None
+    data = _grok2api_get_json(
+        base,
+        access_token,
+        "/accounts",
+        params={"provider": provider, "search": name, "page": 1, "pageSize": 20},
+    )
+    items = data.get("items", []) if isinstance(data, dict) else []
+    fallback_id = None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id")
+        item_name = str(item.get("name", "") or "").strip()
+        item_provider = str(item.get("provider", "") or "").strip()
+        if item_provider and item_provider != provider:
+            continue
+        if fallback_id is None:
+            fallback_id = item_id
+        if item_name.lower() == name.lower():
+            return str(item_id)
+    return str(fallback_id) if fallback_id is not None else None
+
+
+def _grok2api_import_sso_document(base, access_token, endpoint, document, filename):
+    from curl_cffi import CurlMime
+
+    blob = json.dumps(document, ensure_ascii=False).encode("utf-8")
+    mp = CurlMime()
+    mp.addpart(
+        name="files",
+        content_type="application/json",
+        filename=filename,
+        data=blob,
+    )
+    resp = http_post(
+        _grok2api_v1_url(base, endpoint),
+        headers={"Authorization": f"Bearer {access_token}"},
+        multipart=mp,
+        timeout=120,
+        proxies={},
+    )
+    try:
+        resp.raise_for_status()
+    except Exception as exc:
+        raise Exception(f"grok2api 系统账号导入失败: {exc} {getattr(resp, 'text', '')[:300]}")
+    return _parse_grok2api_event_stream(resp.text)
+
+
+def import_sso_to_grok2api_system_account(raw_token, email="", log_callback=None):
+    token = _normalize_sso_token(raw_token)
+    if not token:
+        return False
+    base = _normalize_grok2api_base(config.get("grok2api_remote_base", ""))
+    username = str(config.get("grok2api_system_admin_username", "admin") or "admin").strip()
+    password = _pick_grok2api_system_password()
+    provider = _pick_grok2api_system_provider()
+    tier = _pick_grok2api_system_web_tier()
+    if not base:
+        if log_callback:
+            log_callback("[Debug] grok2api 系统账号导入未配置 Base，跳过")
+        return False
+    access_token = get_grok2api_system_access_token(base, username, password)
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", email or datetime.datetime.now().strftime("%Y%m%d%H%M%S"))
+
+    if provider == "console":
+        document = {
+            "provider": "grok_console",
+            "accounts": [{"name": email or f"Grok Console {safe_name}", "sso_token": token}],
+        }
+        result = _grok2api_import_sso_document(
+            base,
+            access_token,
+            "/accounts/console/import",
+            document,
+            f"grok-console-{safe_name}.json",
+        )
+        if log_callback:
+            suffix = _format_grok2api_task_result(result)
+            log_callback(f"[+] 已导入 grok2api Console 系统账号" + (f": {suffix}" if suffix else ""))
+        return True
+
+    document = {
+        "provider": "grok_web",
+        "accounts": [{"name": email or f"Grok Web {safe_name}", "sso_token": token, "tier": tier}],
+    }
+    result = _grok2api_import_sso_document(
+        base,
+        access_token,
+        "/accounts/web/import",
+        document,
+        f"grok-web-{safe_name}.json",
+    )
+    if log_callback:
+        suffix = _format_grok2api_task_result(result)
+        log_callback(f"[+] 已导入 grok2api Web 系统账号(tier={tier})" + (f": {suffix}" if suffix else ""))
+
+    if provider == "all":
+        web_account_id = _grok2api_find_account_id(base, access_token, "grok_web", email)
+        if not web_account_id:
+            raise Exception(f"grok2api Web 导入后未找到账号 ID: {email}")
+        console_result = _grok2api_post_json_task(
+            base,
+            access_token,
+            "/accounts/web/sync-to-console",
+            {"ids": [web_account_id], "strategy": "missing"},
+            timeout=300,
+        )
+        if log_callback:
+            suffix = _format_grok2api_task_result(console_result)
+            log_callback(f"[+] 已同步 grok2api Console 系统账号" + (f": {suffix}" if suffix else ""))
+
+        build_result = _grok2api_post_json_task(
+            base,
+            access_token,
+            "/accounts/web/convert-to-build",
+            {"ids": [web_account_id], "strategy": "missing"},
+            timeout=600,
+        )
+        if log_callback:
+            suffix = _format_grok2api_task_result(build_result)
+            log_callback(f"[+] 已转换 grok2api Build 系统账号" + (f": {suffix}" if suffix else ""))
+    return True
+
+
 def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
     token = _normalize_sso_token(raw_token)
     if not token:
@@ -440,12 +769,18 @@ def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] 写入 grok2api 本地池失败: {exc}")
-    if config.get("grok2api_auto_add_remote", False):
+    if config.get("grok2api_auto_add_remote", False) and not config.get("grok2api_auto_import_system", False):
         try:
             add_token_to_grok2api_remote_pool(raw_token, email=email, log_callback=log_callback)
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] 写入 grok2api 远端池失败: {exc}")
+    if config.get("grok2api_auto_import_system", False):
+        try:
+            import_sso_to_grok2api_system_account(raw_token, email=email, log_callback=log_callback)
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[!] 导入 grok2api 系统账号失败: {exc}")
 
 
 def import_account_to_cpa(email, password, log_callback=None):
@@ -2358,54 +2693,89 @@ class GrokRegisterGUI:
         self.grok2api_remote_key_var = tk.StringVar(value=str(config.get("grok2api_remote_app_key", "")))
         self.grok2api_remote_key_entry = ttk.Entry(config_frame, textvariable=self.grok2api_remote_key_var, width=30)
         self.grok2api_remote_key_entry.grid(row=13, column=1, columnspan=3, sticky=tk.W, padx=5)
-        ttk.Label(config_frame, text="默认域名(defaultDomains):").grid(row=14, column=0, sticky=tk.W)
+
+        ttk.Label(config_frame, text="grok2api 系统账号导入:").grid(row=14, column=0, sticky=tk.W)
+        self.grok2api_system_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_import_system", False)))
+        self.grok2api_system_auto_check = ttk.Checkbutton(config_frame, variable=self.grok2api_system_auto_var)
+        self.grok2api_system_auto_check.grid(row=14, column=1, sticky=tk.W, padx=5)
+        ttk.Label(config_frame, text="范围:").grid(row=14, column=2, sticky=tk.W, padx=10)
+        self.grok2api_system_provider_var = tk.StringVar(value=str(config.get("grok2api_system_provider", "all") or "all"))
+        self.grok2api_system_provider_combo = ttk.Combobox(
+            config_frame,
+            textvariable=self.grok2api_system_provider_var,
+            values=["all", "web", "console"],
+            width=8,
+            state="readonly",
+        )
+        self.grok2api_system_provider_combo.grid(row=14, column=3, sticky=tk.W, padx=5)
+        ttk.Label(config_frame, text="Web tier:").grid(row=14, column=4, sticky=tk.W, padx=5)
+        self.grok2api_system_web_tier_var = tk.StringVar(value=str(config.get("grok2api_system_web_tier", "auto") or "auto"))
+        self.grok2api_system_web_tier_combo = ttk.Combobox(
+            config_frame,
+            textvariable=self.grok2api_system_web_tier_var,
+            values=["auto", "basic", "super", "heavy"],
+            width=7,
+            state="readonly",
+        )
+        self.grok2api_system_web_tier_combo.grid(row=14, column=5, sticky=tk.W, padx=2)
+
+        ttk.Label(config_frame, text="grok2api 管理员用户:").grid(row=15, column=0, sticky=tk.W)
+        self.grok2api_system_user_var = tk.StringVar(value=str(config.get("grok2api_system_admin_username", "admin") or "admin"))
+        self.grok2api_system_user_entry = ttk.Entry(config_frame, textvariable=self.grok2api_system_user_var, width=14)
+        self.grok2api_system_user_entry.grid(row=15, column=1, sticky=tk.W, padx=5)
+        ttk.Label(config_frame, text="管理员密码:").grid(row=15, column=2, sticky=tk.W, padx=10)
+        self.grok2api_system_password_var = tk.StringVar(value=str(config.get("grok2api_system_admin_password", "")))
+        self.grok2api_system_password_entry = ttk.Entry(config_frame, textvariable=self.grok2api_system_password_var, width=18, show="*")
+        self.grok2api_system_password_entry.grid(row=15, column=3, sticky=tk.W, padx=5)
+
+        ttk.Label(config_frame, text="默认域名(defaultDomains):").grid(row=16, column=0, sticky=tk.W)
         self.default_domains_var = tk.StringVar(value=str(config.get("defaultDomains", "")))
         self.default_domains_entry = ttk.Entry(config_frame, textvariable=self.default_domains_var, width=30)
-        self.default_domains_entry.grid(row=14, column=1, columnspan=3, sticky=tk.W, padx=5)
+        self.default_domains_entry.grid(row=16, column=1, columnspan=3, sticky=tk.W, padx=5)
 
-        ttk.Label(config_frame, text="CPA 注册后自动导入:").grid(row=15, column=0, sticky=tk.W)
+        ttk.Label(config_frame, text="CPA 注册后自动导入:").grid(row=17, column=0, sticky=tk.W)
         self.cpa_auto_import_var = tk.BooleanVar(value=bool(config.get("cpa_auto_import", False)))
         self.cpa_auto_import_check = ttk.Checkbutton(config_frame, variable=self.cpa_auto_import_var)
-        self.cpa_auto_import_check.grid(row=15, column=1, sticky=tk.W, padx=5)
-        ttk.Label(config_frame, text="单账号超时(秒):").grid(row=15, column=2, sticky=tk.W, padx=10)
+        self.cpa_auto_import_check.grid(row=17, column=1, sticky=tk.W, padx=5)
+        ttk.Label(config_frame, text="单账号超时(秒):").grid(row=17, column=2, sticky=tk.W, padx=10)
         self.cpa_timeout_var = tk.StringVar(value=str(config.get("cpa_timeout_s", 240)))
         self.cpa_timeout_spinbox = ttk.Spinbox(config_frame, from_=30, to=1800, increment=30, width=8, textvariable=self.cpa_timeout_var)
-        self.cpa_timeout_spinbox.grid(row=15, column=3, sticky=tk.W, padx=5)
+        self.cpa_timeout_spinbox.grid(row=17, column=3, sticky=tk.W, padx=5)
 
-        ttk.Label(config_frame, text="CPA Base URL:").grid(row=16, column=0, sticky=tk.W)
+        ttk.Label(config_frame, text="CPA Base URL:").grid(row=18, column=0, sticky=tk.W)
         self.cpa_base_url_var = tk.StringVar(value=str(config.get("cpa_base_url", "")))
         self.cpa_base_url_entry = ttk.Entry(config_frame, textvariable=self.cpa_base_url_var, width=30)
-        self.cpa_base_url_entry.grid(row=16, column=1, columnspan=3, sticky=tk.W, padx=5)
+        self.cpa_base_url_entry.grid(row=18, column=1, columnspan=3, sticky=tk.W, padx=5)
 
-        ttk.Label(config_frame, text="CPA Management Key:").grid(row=17, column=0, sticky=tk.W)
+        ttk.Label(config_frame, text="CPA Management Key:").grid(row=19, column=0, sticky=tk.W)
         self.cpa_management_key_var = tk.StringVar(value=str(config.get("cpa_management_key", "")))
         self.cpa_management_key_entry = ttk.Entry(config_frame, textvariable=self.cpa_management_key_var, width=30, show="*")
-        self.cpa_management_key_entry.grid(row=17, column=1, columnspan=3, sticky=tk.W, padx=5)
+        self.cpa_management_key_entry.grid(row=19, column=1, columnspan=3, sticky=tk.W, padx=5)
 
-        ttk.Label(config_frame, text="保存 JSON 文件:").grid(row=18, column=0, sticky=tk.W)
+        ttk.Label(config_frame, text="保存 JSON 文件:").grid(row=20, column=0, sticky=tk.W)
         self.cpa_save_json_var = tk.BooleanVar(value=bool(config.get("cpa_save_json", False)))
         self.cpa_save_json_check = ttk.Checkbutton(config_frame, variable=self.cpa_save_json_var)
-        self.cpa_save_json_check.grid(row=18, column=1, sticky=tk.W, padx=5)
-        ttk.Label(config_frame, text="输出目录:").grid(row=18, column=2, sticky=tk.W, padx=10)
+        self.cpa_save_json_check.grid(row=20, column=1, sticky=tk.W, padx=5)
+        ttk.Label(config_frame, text="输出目录:").grid(row=20, column=2, sticky=tk.W, padx=10)
         self.cpa_records_dir_var = tk.StringVar(value=str(config.get("cpa_records_dir", "cpa_records")))
         self.cpa_records_dir_entry = ttk.Entry(config_frame, textvariable=self.cpa_records_dir_var, width=18)
-        self.cpa_records_dir_entry.grid(row=18, column=3, sticky=tk.W, padx=5)
+        self.cpa_records_dir_entry.grid(row=20, column=3, sticky=tk.W, padx=5)
 
         # ---- Outlook / Hotmail 配置 ----
         outlook_accounts = config.get("outlook_accounts", [])
-        ttk.Label(config_frame, text="Outlook 账号池:").grid(row=19, column=0, sticky=tk.W)
+        ttk.Label(config_frame, text="Outlook 账号池:").grid(row=21, column=0, sticky=tk.W)
         outlook_btn_frame = ttk.Frame(config_frame)
-        outlook_btn_frame.grid(row=19, column=1, sticky=tk.W, padx=5)
+        outlook_btn_frame.grid(row=21, column=1, sticky=tk.W, padx=5)
         self.outlook_import_btn = ttk.Button(outlook_btn_frame, text="导入", command=self.outlook_import_accounts_dialog)
         self.outlook_import_btn.pack(side=tk.LEFT, padx=(0, 3))
         self.outlook_manage_btn = ttk.Button(outlook_btn_frame, text="管理", command=self.outlook_manage_accounts_dialog)
         self.outlook_manage_btn.pack(side=tk.LEFT)
         self.outlook_count_label = ttk.Label(config_frame, text=f"已导入 {len(outlook_accounts)} 个")
-        self.outlook_count_label.grid(row=19, column=2, sticky=tk.W, padx=10)
-        ttk.Label(config_frame, text="别名上限:").grid(row=19, column=3, sticky=tk.W, padx=5)
+        self.outlook_count_label.grid(row=21, column=2, sticky=tk.W, padx=10)
+        ttk.Label(config_frame, text="别名上限:").grid(row=21, column=3, sticky=tk.W, padx=5)
         self.outlook_alias_max_var = tk.StringVar(value=str(config.get("outlook_alias_max_per_account", 5)))
         self.outlook_alias_max_spinbox = ttk.Spinbox(config_frame, from_=1, to=50, width=6, textvariable=self.outlook_alias_max_var)
-        self.outlook_alias_max_spinbox.grid(row=19, column=4, sticky=tk.W, padx=2)
+        self.outlook_alias_max_spinbox.grid(row=21, column=4, sticky=tk.W, padx=2)
 
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X, pady=10)
@@ -3029,6 +3399,11 @@ class GrokRegisterGUI:
         config["grok2api_auto_add_remote"] = bool(self.grok2api_remote_auto_var.get())
         config["grok2api_remote_base"] = self.grok2api_remote_base_var.get().strip()
         config["grok2api_remote_app_key"] = self.grok2api_remote_key_var.get().strip()
+        config["grok2api_auto_import_system"] = bool(self.grok2api_system_auto_var.get())
+        config["grok2api_system_admin_username"] = self.grok2api_system_user_var.get().strip() or "admin"
+        config["grok2api_system_admin_password"] = self.grok2api_system_password_var.get().strip()
+        config["grok2api_system_provider"] = self.grok2api_system_provider_var.get().strip() or "all"
+        config["grok2api_system_web_tier"] = self.grok2api_system_web_tier_var.get().strip() or "auto"
         config["defaultDomains"] = self.default_domains_var.get().strip()
         config["cpa_auto_import"] = bool(self.cpa_auto_import_var.get())
         config["cpa_base_url"] = self.cpa_base_url_var.get().strip()
@@ -3064,6 +3439,16 @@ class GrokRegisterGUI:
         if config["email_provider"] in ("outlook", "outlook-alias") and not config.get("outlook_accounts"):
             self.log("[!] Outlook 模式需要先导入 Outlook 账号")
             return
+        if config.get("grok2api_auto_import_system", False):
+            try:
+                base = _normalize_grok2api_base(config.get("grok2api_remote_base", ""))
+                username = str(config.get("grok2api_system_admin_username", "admin") or "admin").strip()
+                password = _pick_grok2api_system_password()
+                get_grok2api_system_access_token(base, username, password)
+                self.log(f"[*] grok2api 系统账号导入已开启: {base} / {username} / {_pick_grok2api_system_provider()}")
+            except Exception as exc:
+                self.log(f"[!] grok2api 系统账号导入配置无效: {exc}")
+                return
         count = config["register_count"]
         self.stop_requested = False
         self.success_count = 0
